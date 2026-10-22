@@ -2616,7 +2616,7 @@ impl<Signer: EcdsaChannelSigner> ChannelMonitor<Signer> {
 	/// Checks if the monitor is fully resolved. Resolved monitor is one that has claimed all of
 	/// its outputs and balances (i.e. [`Self::get_claimable_balances`] returns an empty set) and
 	/// which does not have any payment preimages for HTLCs which are still pending on other
-	/// channels.
+	/// channels, and which does not have any unhandled events awaiting (or undergoing) handling.
 	///
 	/// Additionally may update state to track when the balances set became empty.
 	///
@@ -2633,6 +2633,11 @@ impl<Signer: EcdsaChannelSigner> ChannelMonitor<Signer> {
 		let current_height = self.current_best_block().height;
 		let mut inner = self.inner.lock().unwrap();
 
+		// Unhandled events may e.g. contain [`Event::SpendableOutputs`] descriptors which, once
+		// the monitor is archived, would no longer be reachable by the application.
+		let no_pending_events =
+			inner.pending_events.is_empty() && !inner.is_processing_pending_events;
+
 		if inner.is_closed_without_updates()
 			&& is_all_funds_claimed
 			&& !inner.funding_spend_seen
@@ -2642,7 +2647,7 @@ impl<Signer: EcdsaChannelSigner> ChannelMonitor<Signer> {
 			// `MonitorEvent`s have been processed. This may be necessary in the case that the monitor
 			// initiated the channel close -- archiving now may leave the `ChannelManager` with a
 			// `Channel` that has no corresponding monitor, which is not allowed on restart.
-			return (inner.pending_monitor_events.is_empty(), false);
+			return (inner.pending_monitor_events.is_empty() && no_pending_events, false);
 		}
 
 		if is_all_funds_claimed && !inner.funding_spend_seen {
@@ -2658,7 +2663,11 @@ impl<Signer: EcdsaChannelSigner> ChannelMonitor<Signer> {
 		match (inner.balances_empty_height, is_all_funds_claimed, preimages_not_needed_elsewhere) {
 			(Some(balances_empty_height), true, true) => {
 				// Claimed all funds, check if reached the blocks threshold.
-				(current_height >= balances_empty_height + ARCHIVAL_DELAY_BLOCKS, false)
+				(
+					current_height >= balances_empty_height + ARCHIVAL_DELAY_BLOCKS
+						&& no_pending_events,
+					false,
+				)
 			},
 			(Some(_), false, _)|(Some(_), _, false) => {
 				// previously assumed we claimed all funds, but we have new funds to claim or
@@ -7758,5 +7767,6 @@ mod tests {
 		log_info!(context_logger, "This is an error");
 		logger.assert_log_context_contains("lightning::chain::channelmonitor::tests", Some(dummy_key), Some(chan_id), 6);
 	}
+
 	// Further testing is done in the ChannelManager integration tests.
 }
