@@ -601,6 +601,131 @@ fn channel_open_failed_releases_intercepted_htlcs() {
 	}
 }
 
+#[test]
+fn fail_stuck_channel_opens_releases_intercepted_htlcs() {
+	// Blocknil patch: a JIT flow whose channel open never completed (the service restarted mid-open,
+	// say) holds the payer's HTLC until its timelock nears. `fail_stuck_channel_opens`, run at
+	// startup, fails it back at once and resets the flow.
+	let chanmon_cfgs = create_chanmon_cfgs(3);
+	let node_cfgs = create_node_cfgs(3, &chanmon_cfgs);
+	let mut service_node_config = test_default_channel_config();
+	service_node_config.htlc_interception_flags = HTLCInterceptionFlags::ToInterceptSCIDs as u8;
+
+	let mut client_node_config = test_default_channel_config();
+	client_node_config.channel_config.accept_underpaying_htlcs = true;
+
+	let node_chanmgrs = create_node_chanmgrs(
+		3,
+		&node_cfgs,
+		&[Some(service_node_config), Some(client_node_config), None],
+	);
+	let nodes = create_network(3, &node_cfgs, &node_chanmgrs);
+	let (lsps_nodes, promise_secret) = setup_test_lsps2_nodes_with_payer(nodes);
+	let LSPSNodesWithPayer { ref service_node, ref client_node, ref payer_node } = lsps_nodes;
+
+	let payer_node_id = payer_node.node.get_our_node_id();
+	let service_node_id = service_node.inner.node.get_our_node_id();
+
+	let service_handler = service_node.liquidity_manager.lsps2_service_handler().unwrap();
+	create_chan_between_nodes_with_value(&payer_node, &service_node.inner, 2_000_000, 100_000);
+
+	let intercept_scid = service_node.node.get_intercept_scid();
+	// Not 42: the test harness opens every channel with user_channel_id 42, and a flow is stuck
+	// only when no channel carries its id.
+	let user_channel_id = 4242u128;
+	let cltv_expiry_delta: u32 = 144;
+	let payment_size_msat = Some(1_000_000);
+	let fee_base_msat: u64 = 1_000;
+
+	execute_lsps2_dance(
+		&service_node,
+		&client_node,
+		intercept_scid,
+		user_channel_id,
+		cltv_expiry_delta,
+		promise_secret,
+		payment_size_msat,
+		fee_base_msat,
+		128,
+	);
+
+	let invoice = create_jit_invoice(
+		&client_node,
+		service_node_id,
+		intercept_scid,
+		cltv_expiry_delta,
+		payment_size_msat,
+		"stuck-channel-open",
+		3600,
+	)
+	.unwrap();
+
+	payer_node
+		.node
+		.pay_for_bolt11_invoice(
+			&invoice,
+			PaymentId(invoice.payment_hash().0),
+			None,
+			OptionalBolt11PaymentParams::default(),
+		)
+		.unwrap();
+
+	check_added_monitors(&payer_node, 1);
+	let events = payer_node.node.get_and_clear_pending_msg_events();
+	let ev = SendEvent::from_event(events[0].clone());
+	service_node.inner.node.handle_update_add_htlc(payer_node_id, &ev.msgs[0]);
+	do_commitment_signed_dance(&service_node.inner, &payer_node, &ev.commitment_msg, false, true);
+	service_node.inner.node.process_pending_htlc_forwards();
+
+	let events = service_node.inner.node.get_and_clear_pending_events();
+	assert_eq!(events.len(), 1);
+	let intercept_id = match &events[0] {
+		Event::HTLCIntercepted {
+			intercept_id,
+			requested_next_hop_scid,
+			payment_hash,
+			expected_outbound_amount_msat,
+			inbound_amount_msat,
+			..
+		} => {
+			assert_eq!(*requested_next_hop_scid, intercept_scid);
+			service_handler
+				.htlc_intercepted(
+					*requested_next_hop_scid,
+					*intercept_id,
+					*expected_outbound_amount_msat,
+					*payment_hash,
+					*inbound_amount_msat,
+				)
+				.unwrap();
+			*intercept_id
+		},
+		other => panic!("Expected HTLCIntercepted, got {:?}", other),
+	};
+
+	match service_node.liquidity_manager.next_event().unwrap() {
+		LiquidityEvent::LSPS2Service(LSPS2ServiceEvent::OpenChannel { .. }) => {},
+		other => panic!("Unexpected event: {:?}", other),
+	};
+
+	// The open never happens: no channel exists for the flow's user_channel_id.
+	assert_eq!(service_handler.fail_stuck_channel_opens(), 1);
+	assert_eq!(service_handler.fail_stuck_channel_opens(), 0, "the flow was reset");
+
+	let res = service_node.inner.node.fail_intercepted_htlc(intercept_id);
+	assert!(res.is_err(), "the intercepted HTLC must already be failed back: {:?}", res);
+
+	let events = service_node.inner.node.get_and_clear_pending_events();
+	assert_eq!(events.len(), 1);
+	match &events[0] {
+		Event::HTLCHandlingFailed {
+			failure_type: HTLCHandlingFailureType::InvalidForward { requested_forward_scid },
+			..
+		} => assert_eq!(*requested_forward_scid, intercept_scid),
+		other => panic!("Expected HTLCHandlingFailed, got {:?}", other),
+	}
+}
+
 /// An intercepted HTLC whose onion declares more than it delivered is failed back before
 /// the JIT channel's state machine sees it, and the client's intercept SCID survives the attempt.
 #[test]
