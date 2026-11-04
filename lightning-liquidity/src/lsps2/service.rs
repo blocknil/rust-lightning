@@ -1370,6 +1370,61 @@ where
 		Ok(())
 	}
 
+	/// Blocknil patch: fails back the HTLCs of every just-in-time flow that is waiting on a channel
+	/// open whose channel doesn't exist (the open failed before a restart, or the channel closed
+	/// during setup), and resets those flows so the payer can try again. Without this the payer's
+	/// HTLC stays held until its timelock nears, which shows on their side as a payment stuck in
+	/// flight for an hour or more. Meant for startup, before any new open can be under way.
+	/// Returns how many HTLCs were failed back.
+	pub async fn fail_stuck_channel_opens(&self) -> usize {
+		let existing: Vec<u128> =
+			self.channel_manager.get_cm().list_channels().iter().map(|c| c.user_channel_id).collect();
+		let mut failed = 0;
+		let mut touched = Vec::new();
+		{
+			let outer_state_lock = self.per_peer_state.read().unwrap();
+			for (counterparty_node_id, inner_state_lock) in outer_state_lock.iter() {
+				let mut peer_state = inner_state_lock.lock().unwrap();
+				let stuck: Vec<u64> = peer_state
+					.intercept_scid_by_user_channel_id
+					.iter()
+					.filter(|(user_channel_id, _)| !existing.contains(user_channel_id))
+					.map(|(_, intercept_scid)| *intercept_scid)
+					.collect();
+				let mut changed = false;
+				for intercept_scid in stuck {
+					if let Some(jit_channel) =
+						peer_state.outbound_channels_by_intercept_scid.get_mut(&intercept_scid)
+					{
+						if let OutboundJITChannelState::PendingChannelOpen { payment_queue, .. } =
+							&mut jit_channel.state
+						{
+							for htlc in payment_queue.clear() {
+								let _ = self
+									.channel_manager
+									.get_cm()
+									.fail_intercepted_htlc(htlc.intercept_id);
+								failed += 1;
+							}
+							jit_channel.state = OutboundJITChannelState::PendingInitialPayment {
+								payment_queue: PaymentQueue::new(),
+							};
+							changed = true;
+						}
+					}
+				}
+				if changed {
+					peer_state.needs_persist |= true;
+					touched.push(*counterparty_node_id);
+				}
+			}
+		}
+		for counterparty_node_id in touched {
+			let _ = self.persist_peer_state(counterparty_node_id).await;
+		}
+		failed
+	}
+
 	/// Used to fail intercepted HTLCs backwards when a channel open attempt ultimately fails.
 	///
 	/// This function should be called after receiving an [`LSPS2ServiceEvent::OpenChannel`] event
