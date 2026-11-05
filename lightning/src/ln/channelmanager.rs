@@ -5023,7 +5023,13 @@ where
 		// around to doing the actual forward, but better to fail early if we can and
 		// hopefully an attacker trying to path-trace payments cannot make this occur
 		// on a small/per-node/per-channel scale.
-		if !chan.context.is_live() {
+		// Blocknil patch: an HTLC the sender asked us to hold is held until its recipient comes
+		// online, so its outgoing channel being offline now is expected, not a reason to fail: when
+		// one provider serves both payer and recipient, the outgoing channel is the offline
+		// recipient's own. It is checked again when the HTLC is released and forwarded.
+		let held_for_offline_recipient =
+			msg.hold_htlc.is_some() && self.config.read().unwrap().enable_htlc_hold;
+		if !chan.context.is_live() && !held_for_offline_recipient {
 			if !chan.context.is_enabled() {
 				return Err(LocalHTLCFailureReason::ChannelDisabled);
 			} else {
