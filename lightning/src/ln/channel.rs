@@ -13127,6 +13127,14 @@ where
 				err: "Cannot begin shutdown while quiescent".to_owned(),
 			});
 		}
+		// Blocknil patch: until both sides have sent `splice_locked`, the closing transaction
+		// would spend the pre-splice funding output, which the confirmed splice already spent, so
+		// it could never confirm and the funds would wait on a force close.
+		if !self.pending_funding().is_empty() {
+			return Err(APIError::APIMisuseError {
+				err: "Cannot begin shutdown while a splice is waiting to lock".to_owned(),
+			});
+		}
 		for htlc in self.context.pending_outbound_htlcs.iter() {
 			if let OutboundHTLCState::LocalAnnounced(_) = htlc.state {
 				return Err(APIError::APIMisuseError {
