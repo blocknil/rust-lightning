@@ -1370,6 +1370,42 @@ where
 		Ok(())
 	}
 
+	/// Blocknil patch: broadcasts every funding transaction still held back for a JIT channel that
+	/// LDK has open and ready, whether or not its opening fee was collected.
+	///
+	/// In the `client_trusts_lsp` flow the funding is broadcast only when the opening fee is paid,
+	/// and only at the moments that could make it so. If the first payment fails after the channel
+	/// is ready (the client refused it, say), nothing tries again: the channel stays open without
+	/// confirmations, the client keeps using it, and its funding never reaches the chain. A
+	/// provider calls this at startup to put such channels on-chain. A funding whose coins were
+	/// spent since is refused by the network, which harms nothing. Returns the transactions
+	/// broadcast.
+	pub fn broadcast_held_funding_transactions(&self) -> Vec<Transaction> {
+		let ready: Vec<u128> = self
+			.channel_manager
+			.get_cm()
+			.list_channels()
+			.iter()
+			.filter(|c| c.is_channel_ready)
+			.map(|c| c.user_channel_id)
+			.collect();
+		let mut broadcast = Vec::new();
+		let outer_state_lock = self.per_peer_state.read().unwrap();
+		for inner_state_lock in outer_state_lock.values() {
+			let peer_state = inner_state_lock.lock().unwrap();
+			for jit_channel in peer_state.outbound_channels_by_intercept_scid.values() {
+				if !ready.contains(&jit_channel.user_channel_id) {
+					continue;
+				}
+				if let Some(funding_tx) = jit_channel.get_funding_tx() {
+					self.tx_broadcaster.broadcast_transactions(&[funding_tx]);
+					broadcast.push(funding_tx.clone());
+				}
+			}
+		}
+		broadcast
+	}
+
 	/// Blocknil patch: fails back the HTLCs of every just-in-time flow that is waiting on a channel
 	/// open whose channel doesn't exist (the open failed before a restart, or the channel closed
 	/// during setup), and resets those flows so the payer can try again. Without this the payer's
