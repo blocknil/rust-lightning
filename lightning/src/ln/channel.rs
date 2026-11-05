@@ -2577,7 +2577,11 @@ impl FundingScope {
 
 		// New reserve values are based on the new channel value and are v2-specific
 		let counterparty_selected_channel_reserve_satoshis = Some(
-			get_v2_channel_reserve_satoshis(post_channel_value, context.holder_dust_limit_satoshis)
+			get_v2_channel_reserve_satoshis(
+				post_channel_value,
+				context.holder_dust_limit_satoshis,
+				prev_funding.counterparty_selected_channel_reserve_satoshis == Some(0),
+			)
 				.map_err(|()| {
 					// This should have been caught in `validate_splice_contributions`
 					debug_assert!(false);
@@ -2592,6 +2596,7 @@ impl FundingScope {
 		let holder_selected_channel_reserve_satoshis = get_v2_channel_reserve_satoshis(
 			post_channel_value,
 			context.counterparty_dust_limit_satoshis,
+			prev_funding.holder_selected_channel_reserve_satoshis == 0,
 		)
 		.map_err(|()| {
 			// This should have been caught in `validate_splice_contributions`
@@ -3521,7 +3526,8 @@ where
 			}
 		}
 
-		if holder_selected_channel_reserve_satoshis < MIN_CHAN_DUST_LIMIT_SATOSHIS {
+		// Blocknil backport (rust-lightning #4428): a zero reserve we chose is allowed.
+		if holder_selected_channel_reserve_satoshis < MIN_CHAN_DUST_LIMIT_SATOSHIS && holder_selected_channel_reserve_satoshis != 0 {
 			// Protocol level safety check in place, although it should never happen because
 			// of `MIN_THEIR_CHAN_RESERVE_SATOSHIS`
 			return Err(ChannelError::close(format!("Suitable channel reserve not found. remote_channel_reserve was ({}). dust_limit_satoshis is ({}).", holder_selected_channel_reserve_satoshis, MIN_CHAN_DUST_LIMIT_SATOSHIS)));
@@ -3533,7 +3539,7 @@ where
 			log_debug!(logger, "channel_reserve_satoshis ({}) is smaller than our dust limit ({}). We can broadcast stale states without any risk, implying this channel is very insecure for our counterparty.",
 				msg_channel_reserve_satoshis, MIN_CHAN_DUST_LIMIT_SATOSHIS);
 		}
-		if holder_selected_channel_reserve_satoshis < open_channel_fields.dust_limit_satoshis {
+		if holder_selected_channel_reserve_satoshis < open_channel_fields.dust_limit_satoshis && holder_selected_channel_reserve_satoshis != 0 {
 			return Err(ChannelError::close(format!("Dust limit ({}) too high for the channel reserve we require the remote to keep ({})", open_channel_fields.dust_limit_satoshis, holder_selected_channel_reserve_satoshis)));
 		}
 
@@ -4254,7 +4260,10 @@ where
 		if channel_reserve_satoshis > funding.get_value_satoshis() {
 			return Err(ChannelError::close(format!("Bogus channel_reserve_satoshis ({}). Must not be greater than ({})", channel_reserve_satoshis, funding.get_value_satoshis())));
 		}
-		if common_fields.dust_limit_satoshis > funding.holder_selected_channel_reserve_satoshis {
+		// Blocknil backport (rust-lightning #4428): a zero reserve we chose is below any dust limit.
+		if common_fields.dust_limit_satoshis > funding.holder_selected_channel_reserve_satoshis
+			&& funding.holder_selected_channel_reserve_satoshis != 0
+		{
 			return Err(ChannelError::close(format!("Dust limit ({}) is bigger than our channel reserve ({})", common_fields.dust_limit_satoshis, funding.holder_selected_channel_reserve_satoshis)));
 		}
 		if channel_reserve_satoshis > funding.get_value_satoshis() - funding.holder_selected_channel_reserve_satoshis {
@@ -4962,6 +4971,11 @@ where
 		let commitment_txid = {
 			let trusted_tx = commitment_data.tx.trust();
 			let bitcoin_tx = trusted_tx.built_transaction();
+			// Blocknil backport (rust-lightning #4428): with a zero reserve a commitment could in
+			// principle end up with no outputs, which can't be broadcast.
+			if bitcoin_tx.transaction.output.is_empty() {
+				return Err(ChannelError::close("Commitment tx from peer has 0 outputs".to_owned()));
+			}
 			let sighash = bitcoin_tx.get_sighash_all(&funding_script, funding.get_value_satoshis());
 
 			log_trace!(logger, "Checking commitment tx signature {} by key {} against tx {} (sighash {}) with redeemscript {} in channel {}",
@@ -6232,6 +6246,14 @@ where
 		}
 
 		let next_channel_type = get_initial_channel_type(user_config, &eligible_features);
+		// Blocknil backport (rust-lightning #4613): a channel with a zero reserve must stay an
+		// anchor channel, so don't fall back to a legacy one.
+		if funding.holder_selected_channel_reserve_satoshis == 0
+			&& !next_channel_type.supports_anchors_zero_fee_htlc_tx()
+			&& !next_channel_type.supports_anchor_zero_fee_commitments()
+		{
+			return Err(());
+		}
 
 		self.feerate_per_kw = selected_commitment_sat_per_1000_weight(
 			&fee_estimator, &next_channel_type,
@@ -6509,10 +6531,15 @@ pub(crate) fn get_legacy_default_holder_selected_channel_reserve_satoshis(
 ///
 /// Returns `Err` if `channel_value_satoshis` is smaller than `dust_limit_satoshis`.
 fn get_v2_channel_reserve_satoshis(
-	channel_value_satoshis: u64, dust_limit_satoshis: u64,
+	channel_value_satoshis: u64, dust_limit_satoshis: u64, is_0reserve: bool,
 ) -> Result<u64, ()> {
 	if channel_value_satoshis < dust_limit_satoshis {
 		return Err(());
+	}
+	// Blocknil backport (rust-lightning #4428): a channel opened with no reserve on one side keeps
+	// none after a splice, instead of going back to 1%.
+	if is_0reserve {
+		return Ok(0);
 	}
 	// Fixed at 1% of channel value by spec.
 	let (q, _) = channel_value_satoshis.overflowing_div(100);
@@ -12295,6 +12322,7 @@ where
 			get_v2_channel_reserve_satoshis(
 				post_channel_value,
 				self.context.holder_dust_limit_satoshis,
+				self.funding.counterparty_selected_channel_reserve_satoshis == Some(0),
 			)
 			.map_err(|()| {
 				format!(
@@ -12307,6 +12335,7 @@ where
 			get_v2_channel_reserve_satoshis(
 				post_channel_value,
 				self.context.counterparty_dust_limit_satoshis,
+				self.funding.holder_selected_channel_reserve_satoshis == 0,
 			)
 			.map_err(|()| {
 				format!(
@@ -13521,9 +13550,27 @@ where
 	      F::Target: FeeEstimator,
 	      L::Target: Logger,
 	{
+		Self::new_with_reserve(fee_estimator, entropy_source, signer_provider, counterparty_node_id, their_features,
+			channel_value_satoshis, push_msat, user_id, config, current_chain_height, outbound_scid_alias,
+			temporary_channel_id, logger, false)
+	}
+
+	/// Blocknil backport (rust-lightning #4428): `is_0reserve` lets the counterparty spend its
+	/// whole balance. Only for anchor channels with a peer we trust not to broadcast old states.
+	#[rustfmt::skip]
+	pub fn new_with_reserve<ES: Deref, F: Deref, L: Deref>(
+		fee_estimator: &LowerBoundedFeeEstimator<F>, entropy_source: &ES, signer_provider: &SP, counterparty_node_id: PublicKey, their_features: &InitFeatures,
+		channel_value_satoshis: u64, push_msat: u64, user_id: u128, config: &UserConfig, current_chain_height: u32,
+		outbound_scid_alias: u64, temporary_channel_id: Option<ChannelId>, logger: L, is_0reserve: bool,
+	) -> Result<OutboundV1Channel<SP>, APIError>
+	where ES::Target: EntropySource,
+	      F::Target: FeeEstimator,
+	      L::Target: Logger,
+	{
 		let holder_selected_channel_reserve_satoshis = get_holder_selected_channel_reserve_satoshis(channel_value_satoshis, config)
 			.map_err(|()| APIError::APIMisuseError { err: format!("The channel value {channel_value_satoshis} is smaller than {MIN_THEIR_CHAN_RESERVE_SATOSHIS}")})?;
-		if holder_selected_channel_reserve_satoshis < MIN_CHAN_DUST_LIMIT_SATOSHIS {
+		let holder_selected_channel_reserve_satoshis = if is_0reserve { 0 } else { holder_selected_channel_reserve_satoshis };
+		if holder_selected_channel_reserve_satoshis < MIN_CHAN_DUST_LIMIT_SATOSHIS && !is_0reserve {
 			// Protocol level safety check in place, although it should never happen because
 			// of `MIN_THEIR_CHAN_RESERVE_SATOSHIS`
 			return Err(APIError::APIMisuseError { err: format!("Holder selected channel reserve below \
@@ -13555,6 +13602,14 @@ where
 			holder_signer,
 			logger,
 		)?;
+		// Blocknil backport (rust-lightning #4613): a zero reserve only on anchor channels.
+		if is_0reserve && !funding.get_channel_type().supports_anchors_zero_fee_htlc_tx()
+			&& !funding.get_channel_type().supports_anchor_zero_fee_commitments()
+		{
+			return Err(APIError::APIMisuseError {
+				err: "A zero reserve is only allowed on anchor channels".to_owned(),
+			});
+		}
 		let unfunded_context = UnfundedChannelContext {
 			unfunded_channel_age_ticks: 0,
 			holder_commitment_point: HolderCommitmentPoint::new(&context.holder_signer, &context.secp_ctx),
@@ -13903,6 +13958,24 @@ where
 			  F::Target: FeeEstimator,
 			  L::Target: Logger,
 	{
+		Self::new_with_reserve(fee_estimator, entropy_source, signer_provider, counterparty_node_id,
+			our_supported_features, their_features, msg, user_id, config, current_chain_height, logger,
+			is_0conf, false)
+	}
+
+	/// Blocknil backport (rust-lightning #4428): `is_0reserve` lets the counterparty spend its
+	/// whole balance. Only for anchor channels with a peer we watch the chain for.
+	#[rustfmt::skip]
+	pub fn new_with_reserve<ES: Deref, F: Deref, L: Deref>(
+		fee_estimator: &LowerBoundedFeeEstimator<F>, entropy_source: &ES, signer_provider: &SP,
+		counterparty_node_id: PublicKey, our_supported_features: &ChannelTypeFeatures,
+		their_features: &InitFeatures, msg: &msgs::OpenChannel, user_id: u128, config: &UserConfig,
+		current_chain_height: u32, logger: &L, is_0conf: bool, is_0reserve: bool,
+	) -> Result<InboundV1Channel<SP>, ChannelError>
+		where ES::Target: EntropySource,
+			  F::Target: FeeEstimator,
+			  L::Target: Logger,
+	{
 		let logger = WithContext::from(logger, Some(counterparty_node_id), Some(msg.common_fields.temporary_channel_id), None);
 
 		// First check the channel type is known, failing before we do anything else if we don't
@@ -13911,6 +13984,13 @@ where
 
 		let holder_selected_channel_reserve_satoshis = get_holder_selected_channel_reserve_satoshis(msg.common_fields.funding_satoshis, config)
 			.map_err(|()| ChannelError::close(format!("The channel value {} is smaller than {MIN_THEIR_CHAN_RESERVE_SATOSHIS}", msg.common_fields.funding_satoshis)))?;
+		// Blocknil backport (rust-lightning #4428, #4613): a zero reserve only on anchor channels.
+		if is_0reserve && !channel_type.supports_anchors_zero_fee_htlc_tx()
+			&& !channel_type.supports_anchor_zero_fee_commitments()
+		{
+			return Err(ChannelError::close("A zero reserve is only allowed on anchor channels".to_owned()));
+		}
+		let holder_selected_channel_reserve_satoshis = if is_0reserve { 0 } else { holder_selected_channel_reserve_satoshis };
 		let counterparty_pubkeys = ChannelPublicKeys {
 			funding_pubkey: msg.common_fields.funding_pubkey,
 			revocation_basepoint: RevocationBasepoint::from(msg.common_fields.revocation_basepoint),
@@ -14152,7 +14232,7 @@ where
 		});
 
 		let holder_selected_channel_reserve_satoshis = get_v2_channel_reserve_satoshis(
-			funding_satoshis, MIN_CHAN_DUST_LIMIT_SATOSHIS
+			funding_satoshis, MIN_CHAN_DUST_LIMIT_SATOSHIS, false
 		).map_err(|()| APIError::APIMisuseError { err: format!(
 			"The channel value {funding_satoshis} is smaller than their dust limit {MIN_CHAN_DUST_LIMIT_SATOSHIS}",
 		)})?;
@@ -14302,12 +14382,12 @@ where
 		let channel_value_satoshis =
 			our_funding_contribution_sats.saturating_add(msg.common_fields.funding_satoshis);
 		let counterparty_selected_channel_reserve_satoshis = get_v2_channel_reserve_satoshis(
-			channel_value_satoshis, MIN_CHAN_DUST_LIMIT_SATOSHIS).map_err(|()| ChannelError::close(format!(
+			channel_value_satoshis, MIN_CHAN_DUST_LIMIT_SATOSHIS, false).map_err(|()| ChannelError::close(format!(
 				"The channel value {channel_value_satoshis} is smaller than our dust limit {MIN_CHAN_DUST_LIMIT_SATOSHIS}"
 		)))?;
 		let their_dust_limit_satoshis = msg.common_fields.dust_limit_satoshis;
 		let holder_selected_channel_reserve_satoshis = get_v2_channel_reserve_satoshis(
-			channel_value_satoshis, their_dust_limit_satoshis
+			channel_value_satoshis, their_dust_limit_satoshis, false
 		).map_err(|()| ChannelError::close(format!(
 			"The channel value {channel_value_satoshis} is smaller than their dust limit {their_dust_limit_satoshis}"
 		)))?;
