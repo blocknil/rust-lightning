@@ -495,11 +495,18 @@ impl TryFrom<CounterpartyForwardingInfo> for PaymentRelay {
 		} = info;
 
 		// Avoid exposing esoteric CLTV expiry deltas
+		//
+		// Blocknil patch: buckets above 216 too, up to LDK's default total route limit (1008). Our
+		// provider asks 720 so that a payer whose app closes while an async payment is held has
+		// days, not hours, to come back and settle before the provider must claim it on-chain.
 		let cltv_expiry_delta = match cltv_expiry_delta {
 			0..=40 => 40,
 			41..=80 => 80,
 			81..=144 => 144,
 			145..=216 => 216,
+			217..=432 => 432,
+			433..=720 => 720,
+			721..=1008 => 1008,
 			_ => return Err(()),
 		};
 
