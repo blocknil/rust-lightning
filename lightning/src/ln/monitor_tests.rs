@@ -444,7 +444,8 @@ fn do_chanmon_claim_value_coop_close(keyed_anchors: bool, p2a_anchor: bool) {
 	assert_eq!(vec![Balance::ClaimableOnChannelClose {
 			balance_candidates: vec![HolderCommitmentTransactionBalance {
 				amount_satoshis: 1_000_000 - 1_000 - commitment_tx_fee - anchor_outputs_value,
-				transaction_fee_satoshis: commitment_tx_fee,
+				// Blocknil patch: the opener's anchor outputs count in the fee it pays.
+				transaction_fee_satoshis: commitment_tx_fee + anchor_outputs_value,
 			}],
 			confirmed_balance_candidate_index: 0,
 			outbound_payment_htlc_rounded_msat: 0,
@@ -648,7 +649,8 @@ fn do_test_claim_value_force_close(keyed_anchors: bool, p2a_anchor: bool, prev_c
 			balance_candidates: vec![HolderCommitmentTransactionBalance {
 				amount_satoshis,
 				// In addition to `commitment_tx_fee`, this also includes the dust HTLC, and the total msat amount rounded down from non-dust HTLCs
-				transaction_fee_satoshis: if p2a_anchor { 0 } else { 1_000_000 - 4_000 - 3_000 - 1_000 - amount_satoshis - anchor_outputs_value },
+				// Blocknil patch: the opener's anchor outputs count in the fee it pays.
+				transaction_fee_satoshis: if p2a_anchor { 0 } else { 1_000_000 - 4_000 - 3_000 - 1_000 - amount_satoshis },
 			}],
 			confirmed_balance_candidate_index: 0,
 			outbound_payment_htlc_rounded_msat: 3300,
@@ -718,7 +720,8 @@ fn do_test_claim_value_force_close(keyed_anchors: bool, p2a_anchor: bool, prev_c
 			balance_candidates: vec![HolderCommitmentTransactionBalance {
 				amount_satoshis, // Channel funding value in satoshis
 				// In addition to `commitment_tx_fee`, this also includes the dust HTLC, and the total msat amount rounded down from non-dust HTLCs
-				transaction_fee_satoshis: if p2a_anchor { 0 } else { 1_000_000 - 4_000 - 3_000 - 1_000 - amount_satoshis - anchor_outputs_value },
+				// Blocknil patch: the opener's anchor outputs count in the fee it pays.
+				transaction_fee_satoshis: if p2a_anchor { 0 } else { 1_000_000 - 4_000 - 3_000 - 1_000 - amount_satoshis },
 			}],
 			confirmed_balance_candidate_index: 0,
 			outbound_payment_htlc_rounded_msat: 3000 + if prev_commitment_tx {
