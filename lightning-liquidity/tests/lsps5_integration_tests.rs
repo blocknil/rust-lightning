@@ -1830,3 +1830,88 @@ fn lsps5_service_persist_resets_in_flight_counter_on_io_error() {
 		res2,
 	);
 }
+
+/// Blocknil patch: an LSP with a host list accepts webhooks on those hosts only, and tells the
+/// client when it refuses one. (Without a list, every other test here shows any host is accepted.)
+#[test]
+fn webhook_hosts_outside_the_allowed_list_are_refused() {
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+	let service_config = LiquidityServiceConfig {
+		#[cfg(lsps1_service)]
+		lsps1_service_config: None,
+		lsps2_service_config: None,
+		lsps5_service_config: Some(LSPS5ServiceConfig {
+			allowed_hosts: Some(vec!["push.example.com".to_string()]),
+			..LSPS5ServiceConfig::default()
+		}),
+		advertise_service: true,
+	};
+	let client_config = LiquidityClientConfig {
+		lsps1_client_config: None,
+		lsps2_client_config: None,
+		lsps5_client_config: Some(LSPS5ClientConfig::default()),
+	};
+	let lsps_nodes = create_service_and_client_nodes_with_kv_stores(
+		nodes,
+		service_config,
+		client_config,
+		Arc::new(DefaultTimeProvider),
+		Arc::new(TestStore::new(false)),
+		Arc::new(TestStore::new(false)),
+	);
+	let LSPSNodes { service_node, client_node, .. } = lsps_nodes;
+	create_chan_between_nodes(&service_node.inner, &client_node.inner);
+	let service_node_id = service_node.inner.node.get_our_node_id();
+	let client_node_id = client_node.inner.node.get_our_node_id();
+	let client_handler = client_node.liquidity_manager.lsps5_client_handler().unwrap();
+
+	// A host that isn't listed: refused, nothing to send, and the client is told.
+	client_handler
+		.set_webhook(service_node_id, "App".to_string(), "https://example.org/webhook".to_string())
+		.unwrap();
+	let request = get_lsps_message!(client_node, service_node_id);
+	let result = service_node.liquidity_manager.handle_custom_message(request, client_node_id);
+	assert!(result.is_err(), "a host outside the list must be refused");
+	assert!(service_node.liquidity_manager.next_event().is_none(), "nothing may be sent to it");
+	let response = get_lsps_message!(service_node, client_node_id);
+	client_node.liquidity_manager.handle_custom_message(response, service_node_id).unwrap();
+	match client_node.liquidity_manager.next_event().unwrap() {
+		LiquidityEvent::LSPS5Client(LSPS5ClientEvent::WebhookRegistrationFailed { error, .. }) => {
+			assert_eq!(error, LSPS5ProtocolError::UnknownError.into());
+		},
+		event => panic!("Expected WebhookRegistrationFailed, got {:?}", event),
+	}
+
+	// The same host with different case and a user-info prefix doesn't slip through either.
+	client_handler
+		.set_webhook(
+			service_node_id,
+			"App".to_string(),
+			"https://push.example.com@example.org/webhook".to_string(),
+		)
+		.unwrap();
+	let request = get_lsps_message!(client_node, service_node_id);
+	let result = service_node.liquidity_manager.handle_custom_message(request, client_node_id);
+	assert!(result.is_err(), "user info naming an allowed host must not pass as that host");
+	let _ = get_lsps_message!(service_node, client_node_id);
+
+	// A listed host, in any case: accepted.
+	client_handler
+		.set_webhook(service_node_id, "App".to_string(), "https://PUSH.example.com/v1".to_string())
+		.unwrap();
+	let request = get_lsps_message!(client_node, service_node_id);
+	service_node.liquidity_manager.handle_custom_message(request, client_node_id).unwrap();
+	match service_node.liquidity_manager.next_event().unwrap() {
+		LiquidityEvent::LSPS5Service(LSPS5ServiceEvent::SendWebhookNotification { .. }) => {},
+		event => panic!("Expected SendWebhookNotification, got {:?}", event),
+	}
+	let response = get_lsps_message!(service_node, client_node_id);
+	client_node.liquidity_manager.handle_custom_message(response, service_node_id).unwrap();
+	match client_node.liquidity_manager.next_event().unwrap() {
+		LiquidityEvent::LSPS5Client(LSPS5ClientEvent::WebhookRegistered { .. }) => {},
+		event => panic!("Expected WebhookRegistered, got {:?}", event),
+	}
+}

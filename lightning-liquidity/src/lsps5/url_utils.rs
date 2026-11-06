@@ -79,6 +79,15 @@ impl LSPSUrl {
 		self.0 .0.as_str()
 	}
 
+	/// The host this URL points at, without any user info before it (which `parse` allows, but
+	/// which no webhook endpoint of ours needs). Blocknil patch: the LSP checks it against the
+	/// hosts it will actually post to.
+	pub fn host(&self) -> &str {
+		let Some((_, remainder)) = self.url().split_once("://") else { return "" };
+		let host_section = remainder.split(['/', '?', '#']).next().unwrap_or("");
+		host_section.split('@').next_back().unwrap_or("")
+	}
+
 	fn is_valid_url_char(c: char) -> bool {
 		c.is_ascii_alphanumeric()
 			|| matches!(c, ':' | '/' | '.' | '@' | '?' | '#' | '%' | '-' | '_' | '&' | '=')

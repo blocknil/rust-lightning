@@ -397,6 +397,11 @@ impl LSPS5WebhookUrl {
 	pub fn as_str(&self) -> &str {
 		self
 	}
+
+	/// The host this URL points at, with any explicit port. Blocknil patch.
+	pub fn host(&self) -> &str {
+		self.0.host()
+	}
 }
 
 impl Deref for LSPS5WebhookUrl {
