@@ -79,6 +79,14 @@ impl_writeable_tlv_based!(Webhook, {
 pub struct LSPS5ServiceConfig {
 	/// Maximum number of webhooks allowed per client.
 	pub max_webhooks_per_client: u32,
+	/// The hosts the LSP will POST notifications to. `None` (the default) accepts any host, as
+	/// upstream does; `Some` accepts only the hosts listed, and `Some` of an empty list accepts none.
+	///
+	/// Blocknil patch: the LSP posts to whatever URL a client registers, so a client could aim it
+	/// at a third party or at an address only the LSP can reach. With a list, only those hosts are
+	/// accepted and the client gets an error, rather than silently getting no push. (Upstream
+	/// has no such list.)
+	pub allowed_hosts: Option<Vec<String>>,
 }
 
 /// Default maximum number of webhooks allowed per client.
@@ -89,7 +97,7 @@ pub const NOTIFICATION_COOLDOWN_TIME: Duration = Duration::from_secs(60); // 1 m
 // Default configuration for LSPS5 service.
 impl Default for LSPS5ServiceConfig {
 	fn default() -> Self {
-		Self { max_webhooks_per_client: DEFAULT_MAX_WEBHOOKS_PER_CLIENT }
+		Self { max_webhooks_per_client: DEFAULT_MAX_WEBHOOKS_PER_CLIENT, allowed_hosts: None }
 	}
 }
 
@@ -372,6 +380,31 @@ where
 		params: SetWebhookRequest,
 	) -> Result<(), LightningError> {
 		let mut message_queue_notifier = self.pending_messages.notifier();
+
+		// Blocknil patch: we POST to whatever URL a client registers, so with a host list only
+		// those hosts are accepted (see `LSPS5ServiceConfig::allowed_hosts`). The client is told,
+		// so its app can show "notifications off" instead of waiting for a push that would never
+		// come.
+		{
+			let host = params.webhook.host();
+			let allowed = match &self.config.allowed_hosts {
+				None => true,
+				Some(hosts) => hosts.iter().any(|allowed| allowed.eq_ignore_ascii_case(host)),
+			};
+			if !allowed {
+				let error = LSPS5ProtocolError::UnknownError;
+				let msg = LSPS5Message::Response(
+					request_id,
+					LSPS5Response::SetWebhookError(error.clone().into()),
+				)
+				.into();
+				message_queue_notifier.enqueue(&counterparty_node_id, msg);
+				return Err(LightningError {
+					err: format!("webhook host {host} is not one of ours"),
+					action: ErrorAction::IgnoreAndLog(Level::Info),
+				});
+			}
+		}
 
 		let mut outer_state_lock = self.per_peer_state.write().unwrap();
 
