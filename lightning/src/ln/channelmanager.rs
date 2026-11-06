@@ -4338,6 +4338,22 @@ where
 		res
 	}
 
+	/// Blocknil patch: whether `node` has at least one channel with us and none of them is
+	/// announced: one of our customers, not a public routing node (see `provided_init_features`).
+	fn has_only_private_channels_with(&self, node: &PublicKey) -> bool {
+		let per_peer_state = self.per_peer_state.read().unwrap();
+		let Some(peer_state_mutex) = per_peer_state.get(node) else { return false };
+		let peer_state = peer_state_mutex.lock().unwrap();
+		let mut any = false;
+		for chan in peer_state.channel_by_id.values() {
+			if chan.context().should_announce() {
+				return false;
+			}
+			any = true;
+		}
+		any
+	}
+
 	/// Gets the list of open channels, in random order. See [`ChannelDetails`] field documentation for
 	/// more information.
 	pub fn list_channels(&self) -> Vec<ChannelDetails> {
@@ -13994,8 +14010,17 @@ where
 		provided_node_features(&self.config.read().unwrap())
 	}
 
-	fn provided_init_features(&self, _their_init_features: PublicKey) -> InitFeatures {
-		provided_init_features(&self.config.read().unwrap())
+	fn provided_init_features(&self, their_node_id: PublicKey) -> InitFeatures {
+		let mut features = provided_init_features(&self.config.read().unwrap());
+		// Blocknil patch: HtlcHold (experimental bit 153) only for peers whose channels with us
+		// are all private, i.e. our customers, the only peers that use it (we hold what they send
+		// to an offline recipient). ACINQ's Eclair drops any peer advertising that bit right after
+		// `init` (found 2026-11-06: an async-payments server role was enough), which kept our
+		// provider from opening a channel to it and from receiving Phoenix's BOLT12 requests.
+		if features.supports_htlc_hold() && !self.has_only_private_channels_with(&their_node_id) {
+			features.clear_htlc_hold();
+		}
+		features
 	}
 
 	#[rustfmt::skip]
