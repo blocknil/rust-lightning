@@ -91,8 +91,20 @@ pub struct LSPS5ServiceConfig {
 
 /// Default maximum number of webhooks allowed per client.
 pub const DEFAULT_MAX_WEBHOOKS_PER_CLIENT: u32 = 10;
-/// Default notification cooldown time in minutes.
-pub const NOTIFICATION_COOLDOWN_TIME: Duration = Duration::from_secs(60); // 1 minute
+/// Shortest time between two webhook notifications to the same client.
+///
+/// Blocknil patch: upstream holds every client to one notification a minute. Our payments are held
+/// for 50 s, so a notification that arrives after that is useless, and a customer receiving two
+/// payments a minute (a tip jar, two payers at once) would get no wake-up for the second.
+///
+/// Ten seconds is not a spam defence — holding a payment costs the payer nothing (fees only settle
+/// on success, and a failed hold costs the sender its own routing attempt), so anyone with a
+/// channel can push a customer once every ten seconds for as long as their invoices keep arriving.
+/// What actually bounds it: this floor per customer, the relay's own per-device rate limit, the
+/// fact that only customers with a channel can register at all, and the customer's ability to stop
+/// it by removing the webhook. Spam also ties up provider liquidity for the length of each hold;
+/// capping holds per customer is a separate follow-up.
+pub const NOTIFICATION_COOLDOWN_TIME: Duration = Duration::from_secs(10);
 
 // Default configuration for LSPS5 service.
 impl Default for LSPS5ServiceConfig {
@@ -666,7 +678,12 @@ where
 				notification.clone(),
 			)?;
 			webhook.last_used = now;
-			webhook.last_notification_sent = Some(now);
+			// Blocknil patch: the acknowledgement of a registration is not a wake-up, so it does
+			// not start the cooldown. A wallet registers as it starts and can be paid seconds
+			// later; that payment still has to wake it.
+			if notification.method != WebhookNotificationMethod::LSPS5WebhookRegistered {
+				webhook.last_notification_sent = Some(now);
+			}
 		}
 		Ok(())
 	}
