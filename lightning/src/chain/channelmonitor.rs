@@ -3118,7 +3118,17 @@ impl<Signer: EcdsaChannelSigner> ChannelMonitor<Signer> {
 					// elided anchors, and the total msat amount rounded down from non-dust HTLCs.
 					let transaction_fee_satoshis = if us.holder_pays_commitment_tx_fee.unwrap_or(true) {
 						let transaction = &funding.current_holder_commitment_tx.trust().built_transaction().transaction;
-						let output_value_sat: u64 = transaction.output.iter().map(|txout| txout.value.to_sat()).sum();
+						// Blocknil patch: the anchor outputs count as what the opener pays too (it
+						// funds them, and they aren't its balance), so this is everything the opener
+						// gives up to the commitment transaction. Only reported, never used to claim.
+						// An output of exactly the anchor value can only be an anchor: anything that
+						// small otherwise is trimmed as dust.
+						let output_value_sat: u64 = transaction
+							.output
+							.iter()
+							.map(|txout| txout.value.to_sat())
+							.filter(|sat| *sat != crate::ln::channel::ANCHOR_OUTPUT_VALUE_SATOSHI)
+							.sum();
 						funding.channel_parameters.channel_value_satoshis - output_value_sat
 					} else {
 						0

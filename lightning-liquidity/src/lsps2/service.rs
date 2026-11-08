@@ -64,8 +64,12 @@ use crate::lsps2::msgs::{
 	LSPS2_GET_INFO_REQUEST_UNRECOGNIZED_OR_STALE_TOKEN_ERROR_CODE,
 };
 
-const MAX_PENDING_REQUESTS_PER_PEER: usize = 10;
-const MAX_TOTAL_PENDING_REQUESTS: usize = 1000;
+// Blocknil patch (testing): upstream allows a client 10 pending requests and outstanding unpaid
+// just-in-time offers, and the whole service 1000. Raised while we test against our own provider,
+// so a wallet that asks for many invoices isn't locked out. Revisit before real customers: this is
+// the provider's protection against a client hoarding intercept slots.
+const MAX_PENDING_REQUESTS_PER_PEER: usize = 1000;
+const MAX_TOTAL_PENDING_REQUESTS: usize = 100_000;
 const MAX_TOTAL_PEERS: usize = 100000;
 
 /// Server-side configuration options for JIT channels.
@@ -1356,6 +1360,97 @@ where
 		})?;
 
 		Ok(())
+	}
+
+	/// Blocknil patch: broadcasts every funding transaction still held back for a JIT channel that
+	/// LDK has open and ready, whether or not its opening fee was collected.
+	///
+	/// In the `client_trusts_lsp` flow the funding is broadcast only when the opening fee is paid,
+	/// and only at the moments that could make it so. If the first payment fails after the channel
+	/// is ready (the client refused it, say), nothing tries again: the channel stays open without
+	/// confirmations, the client keeps using it, and its funding never reaches the chain. A
+	/// provider calls this at startup to put such channels on-chain. A funding whose coins were
+	/// spent since is refused by the network, which harms nothing. Returns the transactions
+	/// broadcast.
+	pub fn broadcast_held_funding_transactions(&self) -> Vec<Transaction> {
+		let ready: Vec<u128> = self
+			.channel_manager
+			.get_cm()
+			.list_channels()
+			.iter()
+			.filter(|c| c.is_channel_ready)
+			.map(|c| c.user_channel_id)
+			.collect();
+		let mut broadcast = Vec::new();
+		let outer_state_lock = self.per_peer_state.read().unwrap();
+		for inner_state_lock in outer_state_lock.values() {
+			let peer_state = inner_state_lock.lock().unwrap();
+			for jit_channel in peer_state.outbound_channels_by_intercept_scid.values() {
+				if !ready.contains(&jit_channel.user_channel_id) {
+					continue;
+				}
+				if let Some(funding_tx) = jit_channel.get_funding_tx() {
+					self.tx_broadcaster.broadcast_transactions(&[funding_tx]);
+					broadcast.push(funding_tx.clone());
+				}
+			}
+		}
+		broadcast
+	}
+
+	/// Blocknil patch: fails back the HTLCs of every just-in-time flow that is waiting on a channel
+	/// open whose channel doesn't exist (the open failed before a restart, or the channel closed
+	/// during setup), and resets those flows so the payer can try again. Without this the payer's
+	/// HTLC stays held until its timelock nears, which shows on their side as a payment stuck in
+	/// flight for an hour or more. Meant for startup, before any new open can be under way.
+	/// Returns how many HTLCs were failed back.
+	pub async fn fail_stuck_channel_opens(&self) -> usize {
+		let existing: Vec<u128> =
+			self.channel_manager.get_cm().list_channels().iter().map(|c| c.user_channel_id).collect();
+		let mut failed = 0;
+		let mut touched = Vec::new();
+		{
+			let outer_state_lock = self.per_peer_state.read().unwrap();
+			for (counterparty_node_id, inner_state_lock) in outer_state_lock.iter() {
+				let mut peer_state = inner_state_lock.lock().unwrap();
+				let stuck: Vec<u64> = peer_state
+					.intercept_scid_by_user_channel_id
+					.iter()
+					.filter(|(user_channel_id, _)| !existing.contains(user_channel_id))
+					.map(|(_, intercept_scid)| *intercept_scid)
+					.collect();
+				let mut changed = false;
+				for intercept_scid in stuck {
+					if let Some(jit_channel) =
+						peer_state.outbound_channels_by_intercept_scid.get_mut(&intercept_scid)
+					{
+						if let OutboundJITChannelState::PendingChannelOpen { payment_queue, .. } =
+							&mut jit_channel.state
+						{
+							for htlc in payment_queue.clear() {
+								let _ = self
+									.channel_manager
+									.get_cm()
+									.fail_intercepted_htlc(htlc.intercept_id);
+								failed += 1;
+							}
+							jit_channel.state = OutboundJITChannelState::PendingInitialPayment {
+								payment_queue: PaymentQueue::new(),
+							};
+							changed = true;
+						}
+					}
+				}
+				if changed {
+					peer_state.needs_persist |= true;
+					touched.push(*counterparty_node_id);
+				}
+			}
+		}
+		for counterparty_node_id in touched {
+			let _ = self.persist_peer_state(counterparty_node_id).await;
+		}
+		failed
 	}
 
 	/// Used to fail intercepted HTLCs backwards when a channel open attempt ultimately fails.

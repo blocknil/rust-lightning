@@ -79,17 +79,35 @@ impl_writeable_tlv_based!(Webhook, {
 pub struct LSPS5ServiceConfig {
 	/// Maximum number of webhooks allowed per client.
 	pub max_webhooks_per_client: u32,
+	/// The hosts the LSP will POST notifications to; empty allows none.
+	///
+	/// Blocknil patch: the LSP posts to whatever URL a client registers, so a client could aim it
+	/// at a third party or at an address only the LSP can reach. Only these hosts are accepted and
+	/// the client is told why, rather than silently getting no push. (Upstream has no such list.)
+	pub allowed_hosts: Vec<String>,
 }
 
 /// Default maximum number of webhooks allowed per client.
 pub const DEFAULT_MAX_WEBHOOKS_PER_CLIENT: u32 = 10;
-/// Default notification cooldown time in minutes.
-pub const NOTIFICATION_COOLDOWN_TIME: Duration = Duration::from_secs(60); // 1 minute
+/// Shortest time between two webhook notifications to the same client.
+///
+/// Blocknil patch: upstream holds every client to one notification a minute. Our payments are held
+/// for 50 s, so a notification that arrives after that is useless, and a customer receiving two
+/// payments a minute (a tip jar, two payers at once) would get no wake-up for the second.
+///
+/// Ten seconds is not a spam defence — holding a payment costs the payer nothing (fees only settle
+/// on success, and a failed hold costs the sender its own routing attempt), so anyone with a
+/// channel can push a customer once every ten seconds for as long as their invoices keep arriving.
+/// What actually bounds it: this floor per customer, the relay's own per-device rate limit, the
+/// fact that only customers with a channel can register at all, and the customer's ability to stop
+/// it by removing the webhook. Spam also ties up provider liquidity for the length of each hold;
+/// capping holds per customer is a separate follow-up.
+pub const NOTIFICATION_COOLDOWN_TIME: Duration = Duration::from_secs(10);
 
 // Default configuration for LSPS5 service.
 impl Default for LSPS5ServiceConfig {
 	fn default() -> Self {
-		Self { max_webhooks_per_client: DEFAULT_MAX_WEBHOOKS_PER_CLIENT }
+		Self { max_webhooks_per_client: DEFAULT_MAX_WEBHOOKS_PER_CLIENT, allowed_hosts: Vec::new() }
 	}
 }
 
@@ -373,6 +391,27 @@ where
 	) -> Result<(), LightningError> {
 		let mut message_queue_notifier = self.pending_messages.notifier();
 
+		// Blocknil patch: we POST to whatever URL a client registers, so only our own relay is
+		// accepted (see `LSPS5ServiceConfig::allowed_hosts`); an empty list accepts none. The
+		// client is told, so its app can show "notifications off" instead of waiting for a push
+		// that would never come.
+		{
+			let host = params.webhook.host();
+			if !self.config.allowed_hosts.iter().any(|allowed| allowed.eq_ignore_ascii_case(host)) {
+				let error = LSPS5ProtocolError::UnknownError;
+				let msg = LSPS5Message::Response(
+					request_id,
+					LSPS5Response::SetWebhookError(error.clone().into()),
+				)
+				.into();
+				message_queue_notifier.enqueue(&counterparty_node_id, msg);
+				return Err(LightningError {
+					err: format!("webhook host {host} is not one of ours"),
+					action: ErrorAction::IgnoreAndLog(Level::Info),
+				});
+			}
+		}
+
 		let mut outer_state_lock = self.per_peer_state.write().unwrap();
 
 		let peer_state =
@@ -633,7 +672,12 @@ where
 				notification.clone(),
 			)?;
 			webhook.last_used = now;
-			webhook.last_notification_sent = Some(now);
+			// Blocknil patch: the acknowledgement of a registration is not a wake-up, so it does
+			// not start the cooldown. A wallet registers as it starts and can be paid seconds
+			// later; that payment still has to wake it.
+			if notification.method != WebhookNotificationMethod::LSPS5WebhookRegistered {
+				webhook.last_notification_sent = Some(now);
+			}
 		}
 		Ok(())
 	}

@@ -4113,8 +4113,51 @@ where
 	/// [`Event::FundingGenerationReady::user_channel_id`]: events::Event::FundingGenerationReady::user_channel_id
 	/// [`Event::FundingGenerationReady::temporary_channel_id`]: events::Event::FundingGenerationReady::temporary_channel_id
 	/// [`Event::ChannelClosed::channel_id`]: events::Event::ChannelClosed::channel_id
+	pub fn create_channel(
+		&self, their_network_key: PublicKey, channel_value_satoshis: u64, push_msat: u64,
+		user_channel_id: u128, temporary_channel_id: Option<ChannelId>,
+		override_config: Option<UserConfig>,
+	) -> Result<ChannelId, APIError> {
+		self.create_channel_internal(
+			their_network_key,
+			channel_value_satoshis,
+			push_msat,
+			user_channel_id,
+			temporary_channel_id,
+			override_config,
+			false,
+		)
+	}
+
+	/// Creates a new outbound channel to the given remote node and with the given value.
+	///
+	/// The only difference from [`ChannelManager::create_channel`] is that the reserve the
+	/// counterparty must keep in the channel is zero. This lets the counterparty spend its whole
+	/// channel balance, and attempt to force-close the channel with a revoked commitment
+	/// transaction *for free*: only use it with a peer you watch the chain for at all times.
+	///
+	/// Only anchor channels may have a zero reserve; the open fails if the channel would not be
+	/// one.
+	///
+	/// Blocknil backport of rust-lightning #4428 (LDK 0.3).
+	pub fn create_channel_to_trusted_peer_0reserve(
+		&self, their_network_key: PublicKey, channel_value_satoshis: u64, push_msat: u64,
+		user_channel_id: u128, temporary_channel_id: Option<ChannelId>,
+		override_config: Option<UserConfig>,
+	) -> Result<ChannelId, APIError> {
+		self.create_channel_internal(
+			their_network_key,
+			channel_value_satoshis,
+			push_msat,
+			user_channel_id,
+			temporary_channel_id,
+			override_config,
+			true,
+		)
+	}
+
 	#[rustfmt::skip]
-	pub fn create_channel(&self, their_network_key: PublicKey, channel_value_satoshis: u64, push_msat: u64, user_channel_id: u128, temporary_channel_id: Option<ChannelId>, override_config: Option<UserConfig>) -> Result<ChannelId, APIError> {
+	fn create_channel_internal(&self, their_network_key: PublicKey, channel_value_satoshis: u64, push_msat: u64, user_channel_id: u128, temporary_channel_id: Option<ChannelId>, override_config: Option<UserConfig>, is_0reserve: bool) -> Result<ChannelId, APIError> {
 		if channel_value_satoshis < 1000 {
 			return Err(APIError::APIMisuseError { err: format!("Channel value must be at least 1000 satoshis. It was {}", channel_value_satoshis) });
 		}
@@ -4148,9 +4191,9 @@ where
 			} else {
 				&*config
 			};
-			match OutboundV1Channel::new(&self.fee_estimator, &self.entropy_source, &self.signer_provider, their_network_key,
+			match OutboundV1Channel::new_with_reserve(&self.fee_estimator, &self.entropy_source, &self.signer_provider, their_network_key,
 				their_features, channel_value_satoshis, push_msat, user_channel_id, config,
-				self.best_block.read().unwrap().height, outbound_scid_alias, temporary_channel_id, &*self.logger)
+				self.best_block.read().unwrap().height, outbound_scid_alias, temporary_channel_id, &*self.logger, is_0reserve)
 			{
 				Ok(res) => res,
 				Err(e) => {
@@ -4218,6 +4261,22 @@ where
 			}
 		}
 		res
+	}
+
+	/// Blocknil patch: whether `node` has at least one channel with us and none of them is
+	/// announced: one of our customers, not a public routing node (see `provided_init_features`).
+	fn has_only_private_channels_with(&self, node: &PublicKey) -> bool {
+		let per_peer_state = self.per_peer_state.read().unwrap();
+		let Some(peer_state_mutex) = per_peer_state.get(node) else { return false };
+		let peer_state = peer_state_mutex.lock().unwrap();
+		let mut any = false;
+		for chan in peer_state.channel_by_id.values() {
+			if chan.context().should_announce() {
+				return false;
+			}
+			any = true;
+		}
+		any
 	}
 
 	/// Gets the list of open channels, in random order. See [`ChannelDetails`] field documentation for
@@ -4948,7 +5007,13 @@ where
 		// around to doing the actual forward, but better to fail early if we can and
 		// hopefully an attacker trying to path-trace payments cannot make this occur
 		// on a small/per-node/per-channel scale.
-		if !chan.context.is_live() {
+		// Blocknil patch: an HTLC the sender asked us to hold is held until its recipient comes
+		// online, so its outgoing channel being offline now is expected, not a reason to fail: when
+		// one provider serves both payer and recipient, the outgoing channel is the offline
+		// recipient's own. It is checked again when the HTLC is released and forwarded.
+		let held_for_offline_recipient =
+			msg.hold_htlc.is_some() && self.config.read().unwrap().enable_htlc_hold;
+		if !chan.context.is_live() && !held_for_offline_recipient {
 			if !chan.context.is_enabled() {
 				return Err(LocalHTLCFailureReason::ChannelDisabled);
 			} else {
@@ -9908,11 +9973,50 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 		)
 	}
 
-	/// TODO(dual_funding): Allow contributions, pass intended amount and inputs
-	#[rustfmt::skip]
+	/// Accepts a request to open a channel after a [`events::Event::OpenChannelRequest`], with
+	/// zero confirmations and/or a zero reserve for the counterparty.
+	///
+	/// With `accept_0reserve`, the counterparty need keep no reserve in the channel: it can spend
+	/// its whole balance, and attempt to force-close the channel with a revoked commitment
+	/// transaction *for free*. Only anchor channels may have a zero reserve.
+	///
+	/// See [`ChannelManager::accept_inbound_channel_from_trusted_peer_0conf`] for `accept_0conf`.
+	///
+	/// Blocknil backport of rust-lightning #4428 (LDK 0.3).
+	pub fn accept_inbound_channel_from_trusted_peer(
+		&self, temporary_channel_id: &ChannelId, counterparty_node_id: &PublicKey,
+		user_channel_id: u128, config_overrides: Option<ChannelConfigOverrides>,
+		accept_0conf: bool, accept_0reserve: bool,
+	) -> Result<(), APIError> {
+		self.do_accept_inbound_channel_with_reserve(
+			temporary_channel_id,
+			counterparty_node_id,
+			accept_0conf,
+			user_channel_id,
+			config_overrides,
+			accept_0reserve,
+		)
+	}
+
 	fn do_accept_inbound_channel(
 		&self, temporary_channel_id: &ChannelId, counterparty_node_id: &PublicKey, accept_0conf: bool,
-		user_channel_id: u128, config_overrides: Option<ChannelConfigOverrides>
+		user_channel_id: u128, config_overrides: Option<ChannelConfigOverrides>,
+	) -> Result<(), APIError> {
+		self.do_accept_inbound_channel_with_reserve(
+			temporary_channel_id,
+			counterparty_node_id,
+			accept_0conf,
+			user_channel_id,
+			config_overrides,
+			false,
+		)
+	}
+
+	/// TODO(dual_funding): Allow contributions, pass intended amount and inputs
+	#[rustfmt::skip]
+	fn do_accept_inbound_channel_with_reserve(
+		&self, temporary_channel_id: &ChannelId, counterparty_node_id: &PublicKey, accept_0conf: bool,
+		user_channel_id: u128, config_overrides: Option<ChannelConfigOverrides>, accept_0reserve: bool,
 	) -> Result<(), APIError> {
 
 		let mut config = self.config.read().unwrap().clone();
@@ -9950,10 +10054,10 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 				let best_block_height = self.best_block.read().unwrap().height;
 				match unaccepted_channel.open_channel_msg {
 					OpenChannelMessage::V1(open_channel_msg) => {
-						InboundV1Channel::new(
+						InboundV1Channel::new_with_reserve(
 							&self.fee_estimator, &self.entropy_source, &self.signer_provider, *counterparty_node_id,
 							&self.channel_type_features(), &peer_state.latest_features, &open_channel_msg,
-							user_channel_id, &config, best_block_height, &self.logger, accept_0conf
+							user_channel_id, &config, best_block_height, &self.logger, accept_0conf, accept_0reserve
 						).map_err(|err| MsgHandleErrInternal::from_chan_no_close(err, *temporary_channel_id)
 						).map(|mut channel| {
 							let logger = WithChannelContext::from(&self.logger, &channel.context, None);
@@ -13776,8 +13880,17 @@ where
 		provided_node_features(&self.config.read().unwrap())
 	}
 
-	fn provided_init_features(&self, _their_init_features: PublicKey) -> InitFeatures {
-		provided_init_features(&self.config.read().unwrap())
+	fn provided_init_features(&self, their_node_id: PublicKey) -> InitFeatures {
+		let mut features = provided_init_features(&self.config.read().unwrap());
+		// Blocknil patch: HtlcHold (experimental bit 153) only for peers whose channels with us
+		// are all private, i.e. our customers, the only peers that use it (we hold what they send
+		// to an offline recipient). ACINQ's Eclair drops any peer advertising that bit right after
+		// `init` (found 2026-11-06: an async-payments server role was enough), which kept our
+		// provider from opening a channel to it and from receiving Phoenix's BOLT12 requests.
+		if features.supports_htlc_hold() && !self.has_only_private_channels_with(&their_node_id) {
+			features.clear_htlc_hold();
+		}
+		features
 	}
 
 	#[rustfmt::skip]

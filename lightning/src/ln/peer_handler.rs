@@ -2718,11 +2718,21 @@ where
 					msg
 				);
 				let encoded_msg = encode_msg!(msg);
+				// Blocknil patch: our own announcement goes to every peer. The spec only forbids
+				// relaying gossip a node didn't generate itself unless asked (`gossip_queries`);
+				// upstream sends nothing to a peer that never sent `gossip_timestamp_filter`, and
+				// a big LND node sends that to only a few peers. With an LND node as our one
+				// public peer, our announcement (address, onion-message support) never left us,
+				// and BOLT12 payers couldn't reach our offers' blinded paths.
+				let ours = self
+					.node_signer
+					.get_node_id(Recipient::Node)
+					.map_or(false, |id| NodeId::from_pubkey(&id) == msg.contents.node_id);
 
 				for (_, peer_mutex) in peers.iter() {
 					let mut peer = peer_mutex.lock().unwrap();
 					if !peer.handshake_complete()
-						|| !peer.should_forward_node_announcement(msg.contents.node_id)
+						|| (!ours && !peer.should_forward_node_announcement(msg.contents.node_id))
 					{
 						continue;
 					}
