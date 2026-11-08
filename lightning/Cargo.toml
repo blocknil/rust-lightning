@@ -64,8 +64,8 @@ features = ["bitcoinconsensus", "secp-recovery"]
 [target.'cfg(ldk_bench)'.dependencies]
 criterion = { version = "0.4", optional = true, default-features = false }
 
-[target.'cfg(taproot)'.dependencies]
-musig2 = { git = "https://github.com/arik-so/rust-musig2", rev = "6f95a05718cbb44d8fe3fa6021aea8117aa38d50" }
+# Blocknil patch: the cfg(taproot) musig2 git dependency is dropped, as the crates.io package drops
+# it. We never build with cfg(taproot); keeping it only made every build fetch a third-party repo.
 
 [lints]
 workspace = true
