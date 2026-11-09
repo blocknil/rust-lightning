@@ -745,7 +745,8 @@ fn do_test_data_loss_protect(reconnect_panicing: bool, substantially_old: bool, 
 			}
 		}
 
-		// Check A panics upon seeing proof it has fallen behind.
+		// Check A closes without broadcasting upon seeing proof it has fallen behind (Blocknil patch;
+		// upstream panics).
 		let reconnect_res = std::panic::catch_unwind(|| {
 			nodes[0].node.handle_channel_reestablish(nodes[1].node.get_our_node_id(), &reestablish_msg);
 		});
@@ -759,8 +760,40 @@ fn do_test_data_loss_protect(reconnect_panicing: bool, substantially_old: bool, 
 				err: "Peer attempted to reestablish channel with a future remote commitment transaction: 2 (received) vs 1 (expected)".to_owned()
 			}, [nodes[1].node.get_our_node_id()], 1000000);
 		} else {
-			assert!(reconnect_res.is_err());
-			// Skip the `Drop` handler for `Node`s as some may be in an invalid (panicked) state.
+			// Blocknil patch: no panic. A closes without broadcasting its revoked state, tells B,
+			// B closes with its latest commitment, and A's monitor claims A's output from it.
+			assert!(reconnect_res.is_ok());
+			check_added_monitors(&nodes[0], 1);
+			assert!(nodes[0].tx_broadcaster.txn_broadcasted.lock().unwrap().is_empty(), "A broadcast its revoked state");
+			let events = nodes[0].node.get_and_clear_pending_events();
+			assert!(events.iter().any(|e| matches!(e, Event::ChannelClosed {
+				reason: ClosureReason::ProcessingError { err }, ..
+			} if err.starts_with("We have fallen behind"))), "{:?}", events);
+			let err_msg = nodes[0].node.get_and_clear_pending_msg_events().into_iter().find_map(|m| match m {
+				MessageSendEvent::HandleError { action: ErrorAction::SendErrorMessage { msg }, .. } => Some(msg),
+				MessageSendEvent::HandleError { action: ErrorAction::DisconnectPeer { msg: Some(msg) }, .. } => Some(msg),
+				_ => None,
+			}).expect("A tells B");
+			// B may have closed already (when A claimed an older state than B had acked); else A's
+			// error makes it close now. Either way B broadcasts its latest commitment.
+			if !nodes[1].node.list_channels().is_empty() {
+				nodes[1].node.handle_error(nodes[0].node.get_our_node_id(), &err_msg);
+				check_added_monitors(&nodes[1], 1);
+			}
+			let funding_txid = chan.3.compute_txid();
+			let commitment = nodes[1].tx_broadcaster.txn_broadcasted.lock().unwrap().split_off(0).into_iter()
+				.find(|tx| tx.input[0].previous_output.txid == funding_txid)
+				.expect("B broadcasts its latest commitment");
+			mine_transaction(&nodes[0], &commitment);
+			connect_blocks(&nodes[0], crate::chain::channelmonitor::ANTI_REORG_DELAY - 1);
+			let claimed: u64 = nodes[0].chain_monitor.chain_monitor.get_and_clear_pending_events().into_iter()
+				.filter_map(|e| match e { Event::SpendableOutputs { outputs, .. } => Some(outputs), _ => None })
+				.flatten()
+				.filter(|o| matches!(o, crate::sign::SpendableOutputDescriptor::StaticPaymentOutput(_)))
+				.map(|o| match o { crate::sign::SpendableOutputDescriptor::StaticPaymentOutput(d) => d.output.value.to_sat(), _ => 0 })
+				.sum();
+			assert!(claimed > 0, "A's monitor didn't claim its output from B's commitment");
+			// Skip the `Drop` handler for `Node`s: A's monitor is still older than B's state.
 			std::mem::forget(nodes);
 		}
 	} else {
