@@ -3084,6 +3084,13 @@ where
 	/// This flag indicates that it is the user's responsibility to validated and broadcast the
 	/// funding transaction.
 	is_manual_broadcast: bool,
+	/// Blocknil patch: set when the peer proved, in `channel_reestablish`, that our state is older
+	/// than theirs (a wallet restored from an old backup). Our latest commitment is then revoked:
+	/// broadcasting it would hand the peer the whole channel. The channel is closed without
+	/// broadcasting, the peer force-closes with its latest state, and the `ChannelMonitor` still
+	/// claims our output on their commitment, which pays our static payment key. Not persisted:
+	/// once closed, the monitor holds `should_broadcast: false`.
+	fallen_behind: bool,
 	is_batch_funding: Option<()>,
 
 	counterparty_next_commitment_point: Option<PublicKey>,
@@ -3759,6 +3766,7 @@ where
 			blocked_monitor_updates: Vec::new(),
 
 			is_manual_broadcast: false,
+			fallen_behind: false,
 
 			interactive_tx_signing_session: None,
 		};
@@ -3998,6 +4006,7 @@ where
 			blocked_monitor_updates: Vec::new(),
 			local_initiated_shutdown: None,
 			is_manual_broadcast: false,
+			fallen_behind: false,
 
 			interactive_tx_signing_session: None,
 		};
@@ -6037,7 +6046,8 @@ where
 		// be delayed in being processed! See the docs for `ChannelManagerReadArgs` for more.
 		assert!(!matches!(self.channel_state, ChannelState::ShutdownComplete));
 
-		let broadcast = self.is_funding_broadcastable();
+		// Blocknil patch: never broadcast a state the peer has proven revoked (see `fallen_behind`).
+		let broadcast = self.is_funding_broadcastable() && !self.fallen_behind;
 
 		// We go ahead and "free" any holding cell HTLCs or HTLCs we haven't yet committed to and
 		// return them to fail the payment.
@@ -9926,19 +9936,18 @@ where
 				return Err(ChannelError::close("Peer sent a garbage channel_reestablish with secret key not matching the commitment height provided".to_owned()));
 			}
 			if msg.next_remote_commitment_number > our_commitment_transaction {
-				macro_rules! log_and_panic {
-					($err_msg: expr) => {
-						log_error!(logger, $err_msg);
-						panic!($err_msg);
-					}
-				}
-				log_and_panic!("We have fallen behind - we have received proof that if we broadcast our counterparty is going to claim all our funds.\n\
-					This implies you have restarted with lost ChannelMonitor and ChannelManager state, the first of which is a violation of the LDK chain::Watch requirements.\n\
-					More specifically, this means you have a bug in your implementation that can cause loss of funds, or you are running with an old backup, which is unsafe.\n\
-					If you have restored from an old backup and wish to claim any available funds, you should restart with\n\
-					an empty ChannelManager and no ChannelMonitors, reconnect to peer(s), ensure they've force-closed all of your\n\
-					previous channels and that the closure transaction(s) have confirmed on-chain,\n\
-					then restart with an empty ChannelManager and the latest ChannelMonitors that you do have.");
+				// Blocknil patch: upstream panics here. On a phone that is a wallet restored from an
+				// old channel backup, and the panic poisons the ChannelManager's locks and aborts the
+				// app on every start, with the money stuck. Instead close without broadcasting (our
+				// latest commitment is revoked) and let the peer close with its latest state; the
+				// ChannelMonitor claims our output from it.
+				self.context.fallen_behind = true;
+				let message = format!(
+					"We have fallen behind: the peer is at our commitment {} and we are at {}. This node was restored from an old backup. Closing without broadcasting our revoked state; the peer's close returns our funds",
+					msg.next_remote_commitment_number, our_commitment_transaction
+				);
+				log_error!(logger, "{}", message);
+				return Err(ChannelError::close(message));
 			}
 		}
 
@@ -15909,6 +15918,7 @@ where
 
 				blocked_monitor_updates: blocked_monitor_updates.unwrap(),
 				is_manual_broadcast: is_manual_broadcast.unwrap_or(false),
+				fallen_behind: false,
 
 				interactive_tx_signing_session,
 			},
