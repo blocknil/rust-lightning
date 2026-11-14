@@ -1384,9 +1384,8 @@ fn test_splice_confirms_on_both_sides_while_disconnected() {
 			script_pubkey: nodes[1].wallet_source.get_change_script().unwrap(),
 		},
 	];
-	let funding_contribution =
-		initiate_splice_out(&nodes[0], &nodes[1], channel_id, outputs).unwrap();
-	let (splice_tx, _) = splice_channel(&nodes[0], &nodes[1], channel_id, funding_contribution);
+	let funding_contribution = SpliceContribution::SpliceOut { outputs };
+	let splice_tx = splice_channel(&nodes[0], &nodes[1], channel_id, funding_contribution);
 
 	// Disconnect before either side confirms the splice.
 	nodes[0].node.peer_disconnected(node_id_1);
@@ -1475,8 +1474,7 @@ fn test_stale_announcement_signatures_ignored_after_splice_lock() {
 	let chanmon_cfgs = create_chanmon_cfgs(2);
 	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
 	let mut config = test_default_channel_config();
-	config.channel_handshake_config.announced_channel_max_inbound_htlc_value_in_flight_percentage =
-		100;
+	config.channel_handshake_config.max_inbound_htlc_value_in_flight_percent_of_channel = 100;
 	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, Some(config)]);
 	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
 
@@ -1521,9 +1519,8 @@ fn test_stale_announcement_signatures_ignored_after_splice_lock() {
 			script_pubkey: nodes[1].wallet_source.get_change_script().unwrap(),
 		},
 	];
-	let funding_contribution =
-		initiate_splice_out(&nodes[0], &nodes[1], channel_id, outputs).unwrap();
-	let (splice_tx, _) = splice_channel(&nodes[0], &nodes[1], channel_id, funding_contribution);
+	let funding_contribution = SpliceContribution::SpliceOut { outputs };
+	let splice_tx = splice_channel(&nodes[0], &nodes[1], channel_id, funding_contribution);
 	mine_transaction(&nodes[0], &splice_tx);
 	mine_transaction(&nodes[1], &splice_tx);
 	lock_splice_after_blocks(&nodes[0], &nodes[1], ANTI_REORG_DELAY - 1);
