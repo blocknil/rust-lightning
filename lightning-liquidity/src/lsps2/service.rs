@@ -1115,6 +1115,19 @@ where
 		Ok(())
 	}
 
+	/// Blocknil patch: the customer and channel of the JIT channel opened for `intercept_scid`,
+	/// once it is ready (from the persisted state, so also after a restart).
+	pub fn jit_channel_for_intercept_scid(&self, intercept_scid: u64) -> Option<(PublicKey, ChannelId)> {
+		let peer = *self.peer_by_intercept_scid.read().unwrap().get(&intercept_scid)?;
+		let outer_state_lock = self.per_peer_state.read().unwrap();
+		let peer_state = outer_state_lock.get(&peer)?.lock().unwrap();
+		peer_state
+			.intercept_scid_by_channel_id
+			.iter()
+			.find(|(_, scid)| **scid == intercept_scid)
+			.map(|(channel_id, _)| (peer, *channel_id))
+	}
+
 	/// Forward [`Event::HTLCHandlingFailed`] event parameter into this function.
 	///
 	/// Will attempt to forward the next payment in the queue if one is present.
@@ -2831,6 +2844,48 @@ mod tests {
 				matches!(action, Some(HTLCInterceptedAction::ForwardHTLC(channel_id)) if channel_id == ChannelId([200; 32]))
 			);
 		}
+	}
+
+	#[test]
+	fn a_forwarded_payment_handed_back_as_intercepted_is_forwarded_again() {
+		// Blocknil patch. Our rust-lightning fork hands an intercepted HTLC back as intercepted
+		// (instead of failing it to the payer) when its forward finds the recipient disconnected.
+		// The returned HTLC is then queued again, and treating it as a failed forward
+		// (`htlc_handling_failed`) yields it to be forwarded again, with the same fee.
+		let opening_fee_params = LSPS2OpeningFeeParams {
+			min_fee_msat: 10_000_000,
+			proportional: 10_000,
+			valid_until: LSPSDateTime::from_str("2035-05-20T08:30:45Z").unwrap(),
+			min_lifetime: 4032,
+			max_client_to_self_delay: 2016,
+			min_payment_size_msat: 10_000_000,
+			max_payment_size_msat: 1_000_000_000,
+			promise: "ignore".to_string(),
+		};
+		let htlc = InterceptedHTLC {
+			intercept_id: InterceptId([7; 32]),
+			expected_outbound_amount_msat: 500_000_000,
+			payment_hash: PaymentHash([107; 32]),
+		};
+		let mut state = OutboundJITChannelState::new();
+		let action = state.htlc_intercepted(&opening_fee_params, &None, htlc.clone()).unwrap();
+		assert!(matches!(action, Some(HTLCInterceptedAction::OpenChannel(_))));
+		let ForwardPaymentAction(_, payment) = state.channel_ready(ChannelId([200; 32])).unwrap();
+		assert_eq!(payment.htlcs, vec![htlc.clone()]);
+
+		// The forward finds the recipient gone; the same HTLC comes back as intercepted.
+		let action = state.htlc_intercepted(&opening_fee_params, &None, htlc.clone()).unwrap();
+		assert!(action.is_none());
+		assert!(matches!(state, OutboundJITChannelState::PendingPaymentForward { .. }));
+		match state.htlc_handling_failed().unwrap() {
+			Some(ForwardPaymentAction(channel_id, payment)) => {
+				assert_eq!(channel_id, ChannelId([200; 32]));
+				assert_eq!(payment.htlcs, vec![htlc]);
+				assert_eq!(payment.opening_fee_msat, 10_000_000);
+			},
+			other => panic!("the returned HTLC is not forwarded again: {other:?}"),
+		}
+		assert!(matches!(state, OutboundJITChannelState::PendingPaymentForward { .. }));
 	}
 
 	#[test]
