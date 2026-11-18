@@ -1866,7 +1866,7 @@ where
 	}
 
 	pub fn tx_complete<L: Deref>(
-		&mut self, msg: &msgs::TxComplete, logger: &L,
+		&mut self, msg: &msgs::TxComplete, trust_own_splice_inputs_0conf: bool, logger: &L,
 	) -> Result<
 		(Option<InteractiveTxMessageSend>, Option<msgs::CommitmentSigned>),
 		(ChannelError, Option<SpliceFundingFailed>),
@@ -1906,7 +1906,7 @@ where
 		};
 
 		let commitment_signed = self
-			.funding_tx_constructed(funding_outpoint, logger)
+			.funding_tx_constructed(funding_outpoint, trust_own_splice_inputs_0conf, logger)
 			.map_err(|abort_reason| self.fail_interactive_tx_negotiation(abort_reason, logger))?;
 		Ok((interactive_tx_msg_send, Some(commitment_signed)))
 	}
@@ -2018,7 +2018,7 @@ where
 	}
 
 	fn funding_tx_constructed<L: Deref>(
-		&mut self, funding_outpoint: OutPoint, logger: &L,
+		&mut self, funding_outpoint: OutPoint, trust_own_splice_inputs_0conf: bool, logger: &L,
 	) -> Result<msgs::CommitmentSigned, AbortReason>
 	where
 		L::Target: Logger,
@@ -2129,6 +2129,28 @@ where
 		};
 
 		let signing_session = interactive_tx_constructor.into_signing_session();
+		// Blocknil patch: a splice whose inputs, other than the shared one, are all ours can be
+		// trusted at zero confirmations when the user asked for it
+		// (`UserConfig::trust_own_splice_inputs_0conf`). The minimum depth exists for inputs the
+		// counterparty controls, and there are none.
+		if trust_own_splice_inputs_0conf
+			&& !signing_session.unsigned_tx().has_counterparty_contributed_inputs()
+		{
+			if let ChannelPhase::Funded(chan) = &mut self.phase {
+				if let Some(FundingNegotiation::AwaitingSignatures { funding, .. }) = chan
+					.pending_splice
+					.as_mut()
+					.and_then(|pending_splice| pending_splice.funding_negotiation.as_mut())
+				{
+					log_info!(
+						logger,
+						"Trusting our own splice of channel {} at zero confirmations: the counterparty added no inputs",
+						chan.context.channel_id
+					);
+					funding.minimum_depth_override = Some(0);
+				}
+			}
+		}
 		self.context_mut().interactive_tx_signing_session = Some(signing_session);
 		Ok(commitment_signed)
 	}

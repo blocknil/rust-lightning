@@ -25,6 +25,7 @@ use crate::ln::funding::{FundingTxInput, SpliceContribution};
 use crate::ln::msgs::{self, BaseMessageHandler, ChannelMessageHandler, MessageSendEvent};
 use crate::ln::types::ChannelId;
 use crate::routing::router::{PaymentParameters, RouteParameters};
+use crate::util::config::UserConfig;
 use crate::util::errors::APIError;
 use crate::util::ser::Writeable;
 use crate::util::test_channel_signer::SignerOp;
@@ -1938,6 +1939,175 @@ fn test_trust_own_funding_does_not_trust_counterparty_splice_inputs() {
 		.into_iter()
 		.find(|channel| channel.channel_id == channel_id)
 		.unwrap();
+	assert_eq!(channel.funding_txo.unwrap().txid, original_funding_txid);
+}
+
+/// Opens a channel from node 0 to node 1, which accepts it from node 0 as a trusted peer at zero
+/// confirmations (as a wallet does its Lightning service provider), with `provider_config` for
+/// node 0. Returns the nodes' channel id once the funding transaction is mined on both sides.
+fn open_provider_channel<'a, 'b, 'c, 'd>(
+	nodes: &'a Vec<Node<'b, 'c, 'd>>,
+) -> (ChannelId, bitcoin::Txid) {
+	let (funding_tx, channel_id) =
+		open_zero_conf_channel_with_value(&nodes[0], &nodes[1], None, 100_000, 0);
+	mine_transaction(&nodes[0], &funding_tx);
+	mine_transaction(&nodes[1], &funding_tx);
+	(channel_id, funding_tx.compute_txid())
+}
+
+fn provider_and_customer_configs(trust_own_splice_inputs_0conf: bool) -> (UserConfig, UserConfig) {
+	let mut provider = test_default_channel_config();
+	provider.channel_handshake_config.announce_for_forwarding = false;
+	provider.channel_handshake_config.minimum_depth = 6;
+	provider.channel_handshake_config.max_inbound_htlc_value_in_flight_percent_of_channel = 100;
+	provider.trust_own_splice_inputs_0conf = trust_own_splice_inputs_0conf;
+	let mut customer = provider.clone();
+	customer.manually_accept_inbound_channels = true;
+	customer.trust_own_splice_inputs_0conf = false;
+	(provider, customer)
+}
+
+/// Blocknil patch: with `UserConfig::trust_own_splice_inputs_0conf`, a splice whose inputs (besides
+/// the shared one) are all ours is locked at once, so the room it adds can carry a payment before
+/// any block confirms it.
+#[test]
+fn test_own_inputs_splice_locks_at_zero_conf_when_trusted() {
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let (provider, customer) = provider_and_customer_configs(true);
+	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[Some(provider), Some(customer)]);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+	let node_id_0 = nodes[0].node.get_our_node_id();
+	let node_id_1 = nodes[1].node.get_our_node_id();
+
+	let (channel_id, original_funding_txid) = open_provider_channel(&nodes);
+	let limit_before = nodes[0].node.list_channels()[0].next_outbound_htlc_limit_msat;
+
+	// Node 0 adds only its own coins.
+	let coinbase_tx = provide_anchor_reserves(&nodes);
+	let contribution = SpliceContribution::SpliceIn {
+		value: Amount::from_sat(200_000),
+		inputs: vec![FundingTxInput::new_p2wpkh(coinbase_tx, 0).unwrap()],
+		change_script: Some(nodes[0].wallet_source.get_change_script().unwrap()),
+	};
+	let new_funding_script =
+		complete_splice_handshake(&nodes[0], &nodes[1], channel_id, contribution.clone());
+	let initial_commit_sig = complete_interactive_funding_negotiation(
+		&nodes[0],
+		&nodes[1],
+		channel_id,
+		contribution,
+		new_funding_script,
+	);
+	// Node 0 sends `splice_locked` together with its `tx_signatures`: no confirmation needed.
+	let (splice_tx, splice_locked) =
+		sign_interactive_funding_tx(&nodes[0], &nodes[1], initial_commit_sig, true);
+	expect_splice_pending_event(&nodes[0], &node_id_1);
+	expect_splice_pending_event(&nodes[1], &node_id_0);
+	let (splice_locked, destination) = splice_locked.expect("splice_locked at zero confirmations");
+	assert_eq!(destination, node_id_1);
+
+	// Node 1 trusts node 0's channel at zero confirmations, so it locks too, and the channel moves
+	// to the splice's funding without a block.
+	lock_splice(&nodes[0], &nodes[1], &splice_locked, true);
+	let channel = nodes[0].node.list_channels().into_iter().next().unwrap();
+	assert_eq!(channel.funding_txo.unwrap().txid, splice_tx.compute_txid());
+	assert_ne!(channel.funding_txo.unwrap().txid, original_funding_txid);
+
+	// The added room carries a payment larger than the channel could before, unconfirmed.
+	let limit_after = channel.next_outbound_htlc_limit_msat;
+	assert!(limit_after > limit_before + 100_000_000, "{limit_before} -> {limit_after}");
+	send_payment(&nodes[0], &[&nodes[1]], limit_before + 50_000_000);
+}
+
+/// Blocknil patch: without the option, the same splice waits for the channel's minimum depth, as
+/// upstream does.
+#[test]
+fn test_own_inputs_splice_waits_for_depth_by_default() {
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let (provider, customer) = provider_and_customer_configs(false);
+	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[Some(provider), Some(customer)]);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+	let node_id_0 = nodes[0].node.get_our_node_id();
+	let node_id_1 = nodes[1].node.get_our_node_id();
+
+	let (channel_id, original_funding_txid) = open_provider_channel(&nodes);
+
+	let coinbase_tx = provide_anchor_reserves(&nodes);
+	let contribution = SpliceContribution::SpliceIn {
+		value: Amount::from_sat(200_000),
+		inputs: vec![FundingTxInput::new_p2wpkh(coinbase_tx, 0).unwrap()],
+		change_script: Some(nodes[0].wallet_source.get_change_script().unwrap()),
+	};
+	let new_funding_script =
+		complete_splice_handshake(&nodes[0], &nodes[1], channel_id, contribution.clone());
+	let initial_commit_sig = complete_interactive_funding_negotiation(
+		&nodes[0],
+		&nodes[1],
+		channel_id,
+		contribution,
+		new_funding_script,
+	);
+	let (_splice_tx, splice_locked) =
+		sign_interactive_funding_tx(&nodes[0], &nodes[1], initial_commit_sig, false);
+	assert!(splice_locked.is_none(), "locked without the option");
+	expect_splice_pending_event(&nodes[0], &node_id_1);
+	expect_splice_pending_event(&nodes[1], &node_id_0);
+
+	// Node 1 trusts node 0 at zero confirmations and locks at once; node 0 still waits.
+	let customer_locked = get_event_msg!(nodes[1], MessageSendEvent::SendSpliceLocked, node_id_0);
+	nodes[0].node.handle_splice_locked(node_id_1, &customer_locked);
+	assert!(nodes[0].node.get_and_clear_pending_msg_events().is_empty());
+	check_added_monitors(&nodes[0], 0);
+	assert_eq!(get_monitor!(nodes[0], channel_id).get_funding_txo().txid, original_funding_txid);
+	let channel = nodes[0].node.list_channels().into_iter().next().unwrap();
+	assert_eq!(channel.funding_txo.unwrap().txid, original_funding_txid);
+}
+
+/// Blocknil patch: the option never trusts a counterparty's inputs. A splice the counterparty
+/// funds is still only promoted once it reaches the minimum depth, even with the option set.
+#[test]
+fn test_trust_own_splice_inputs_does_not_trust_counterparty_inputs() {
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let (provider, customer) = provider_and_customer_configs(true);
+	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[Some(provider), Some(customer)]);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+	let node_id_0 = nodes[0].node.get_our_node_id();
+	let node_id_1 = nodes[1].node.get_our_node_id();
+
+	let (channel_id, original_funding_txid) = open_provider_channel(&nodes);
+
+	// Node 1 splices in its own coins; node 0, which has the option, adds nothing.
+	let coinbase_tx = provide_anchor_reserves(&nodes);
+	let contribution = SpliceContribution::SpliceIn {
+		value: Amount::from_sat(50_000),
+		inputs: vec![FundingTxInput::new_p2wpkh(coinbase_tx, 1).unwrap()],
+		change_script: Some(nodes[1].wallet_source.get_change_script().unwrap()),
+	};
+	let new_funding_script =
+		complete_splice_handshake(&nodes[1], &nodes[0], channel_id, contribution.clone());
+	let initial_commit_sig = complete_interactive_funding_negotiation(
+		&nodes[1],
+		&nodes[0],
+		channel_id,
+		contribution,
+		new_funding_script,
+	);
+	let (_splice_tx, splice_locked) =
+		sign_interactive_funding_tx(&nodes[1], &nodes[0], initial_commit_sig, true);
+	expect_splice_pending_event(&nodes[0], &node_id_1);
+	expect_splice_pending_event(&nodes[1], &node_id_0);
+
+	// Node 1's early `splice_locked` changes nothing at node 0, and node 0 sends none of its own.
+	let (splice_locked, destination) = splice_locked.unwrap();
+	assert_eq!(destination, node_id_0);
+	nodes[0].node.handle_splice_locked(node_id_1, &splice_locked);
+	assert_eq!(get_monitor!(nodes[0], channel_id).get_funding_txo().txid, original_funding_txid);
+	assert!(nodes[0].node.get_and_clear_pending_msg_events().is_empty());
+	check_added_monitors(&nodes[0], 0);
+	let channel = nodes[0].node.list_channels().into_iter().next().unwrap();
 	assert_eq!(channel.funding_txo.unwrap().txid, original_funding_txid);
 }
 
