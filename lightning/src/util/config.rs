@@ -988,6 +988,25 @@ pub struct UserConfig {
 	///
 	/// [`ChannelManager::splice_channel`]: crate::ln::channelmanager::ChannelManager::splice_channel
 	pub reject_inbound_splices: bool,
+	/// If this is set to `true`, a splice in which our counterparty contributed no inputs (every
+	/// input other than the channel's shared funding input is ours) is treated as locked at zero
+	/// confirmations, so the added funds are usable immediately.
+	///
+	/// By default a splice must reach the channel's minimum depth before it is locked, because it
+	/// may include inputs only the counterparty controls, which it could double-spend before
+	/// confirmation. A splice without counterparty inputs carries no such risk to us: only we can
+	/// double-spend our own inputs, and the shared input needs both signatures. The risk left is our
+	/// own: a splice that does not confirm (for example because its feerate is too low) has to be
+	/// fee-bumped by us. A Lightning service provider adding its own funds to a client's channel to
+	/// receive an incoming payment is the intended use.
+	///
+	/// This only changes when *we* consider the splice locked; the counterparty applies its own
+	/// rules.
+	///
+	/// Default value: `false`
+	///
+	/// (Blocknil patch.)
+	pub trust_own_splice_inputs_0conf: bool,
 }
 
 impl Default for UserConfig {
@@ -1006,6 +1025,7 @@ impl Default for UserConfig {
 			enable_htlc_hold: false,
 			hold_outbound_htlcs_at_next_hop: false,
 			reject_inbound_splices: true,
+			trust_own_splice_inputs_0conf: false,
 		}
 	}
 }
@@ -1028,6 +1048,7 @@ impl Readable for UserConfig {
 		let hold_outbound_htlcs_at_next_hop = Readable::read(reader)?;
 		let enable_htlc_hold = Readable::read(reader)?;
 		let reject_inbound_splices = Readable::read(reader)?;
+		let trust_own_splice_inputs_0conf = Readable::read(reader)?;
 		Ok(Self {
 			channel_handshake_config,
 			channel_handshake_limits,
@@ -1042,6 +1063,7 @@ impl Readable for UserConfig {
 			hold_outbound_htlcs_at_next_hop,
 			enable_htlc_hold,
 			reject_inbound_splices,
+			trust_own_splice_inputs_0conf,
 		})
 	}
 }
