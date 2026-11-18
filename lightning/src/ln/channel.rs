@@ -1866,7 +1866,8 @@ where
 	}
 
 	pub fn tx_complete<L: Deref>(
-		&mut self, msg: &msgs::TxComplete, trust_own_splice_inputs_0conf: bool, logger: &L,
+		&mut self, msg: &msgs::TxComplete, trust_own_splice_inputs_0conf: bool,
+		trust_counterparty_splice_0conf: bool, logger: &L,
 	) -> Result<
 		(Option<InteractiveTxMessageSend>, Option<msgs::CommitmentSigned>),
 		(ChannelError, Option<SpliceFundingFailed>),
@@ -1906,7 +1907,12 @@ where
 		};
 
 		let commitment_signed = self
-			.funding_tx_constructed(funding_outpoint, trust_own_splice_inputs_0conf, logger)
+			.funding_tx_constructed(
+				funding_outpoint,
+				trust_own_splice_inputs_0conf,
+				trust_counterparty_splice_0conf,
+				logger,
+			)
 			.map_err(|abort_reason| self.fail_interactive_tx_negotiation(abort_reason, logger))?;
 		Ok((interactive_tx_msg_send, Some(commitment_signed)))
 	}
@@ -2018,7 +2024,8 @@ where
 	}
 
 	fn funding_tx_constructed<L: Deref>(
-		&mut self, funding_outpoint: OutPoint, trust_own_splice_inputs_0conf: bool, logger: &L,
+		&mut self, funding_outpoint: OutPoint, trust_own_splice_inputs_0conf: bool,
+		trust_counterparty_splice_0conf: bool, logger: &L,
 	) -> Result<msgs::CommitmentSigned, AbortReason>
 	where
 		L::Target: Logger,
@@ -2133,8 +2140,11 @@ where
 		// trusted at zero confirmations when the user asked for it
 		// (`UserConfig::trust_own_splice_inputs_0conf`). The minimum depth exists for inputs the
 		// counterparty controls, and there are none.
-		if trust_own_splice_inputs_0conf
-			&& !signing_session.unsigned_tx().has_counterparty_contributed_inputs()
+		// Blocknil patch: likewise any splice with a counterparty the user trusts at zero
+		// confirmations (`UserConfig::trusted_splice_peers_0conf`).
+		if trust_counterparty_splice_0conf
+			|| (trust_own_splice_inputs_0conf
+				&& !signing_session.unsigned_tx().has_counterparty_contributed_inputs())
 		{
 			if let ChannelPhase::Funded(chan) = &mut self.phase {
 				if let Some(FundingNegotiation::AwaitingSignatures { funding, .. }) = chan
@@ -2144,8 +2154,13 @@ where
 				{
 					log_info!(
 						logger,
-						"Trusting our own splice of channel {} at zero confirmations: the counterparty added no inputs",
-						chan.context.channel_id
+						"Trusting the splice of channel {} at zero confirmations: {}",
+						chan.context.channel_id,
+						if trust_counterparty_splice_0conf {
+							"the counterparty is trusted"
+						} else {
+							"the counterparty added no inputs"
+						}
 					);
 					funding.minimum_depth_override = Some(0);
 				}
