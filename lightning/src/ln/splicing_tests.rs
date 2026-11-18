@@ -25,6 +25,7 @@ use crate::ln::funding::{FundingTxInput, SpliceContribution};
 use crate::ln::msgs::{self, BaseMessageHandler, ChannelMessageHandler, MessageSendEvent};
 use crate::ln::types::ChannelId;
 use crate::routing::router::{PaymentParameters, RouteParameters};
+use crate::sign::{NodeSigner, Recipient};
 use crate::util::config::UserConfig;
 use crate::util::errors::APIError;
 use crate::util::ser::Writeable;
@@ -2109,6 +2110,86 @@ fn test_trust_own_splice_inputs_does_not_trust_counterparty_inputs() {
 	check_added_monitors(&nodes[0], 0);
 	let channel = nodes[0].node.list_channels().into_iter().next().unwrap();
 	assert_eq!(channel.funding_txo.unwrap().txid, original_funding_txid);
+}
+
+/// Blocknil patch: a channel the customer opened (so not accepted at zero confirmations on its
+/// side), into which its provider splices its own funds. With the provider in the customer's
+/// `trusted_splice_peers_0conf` and `trust_own_splice_inputs_0conf` on the provider, both lock at
+/// once and the added room carries a payment before any block.
+fn do_test_provider_splice_into_customer_opened_channel(customer_trusts_provider: bool) {
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let mut customer = test_default_channel_config();
+	customer.channel_handshake_config.max_inbound_htlc_value_in_flight_percent_of_channel = 100;
+	let mut provider = customer.clone();
+	provider.trust_own_splice_inputs_0conf = true;
+	// Node 0 is the customer, node 1 its provider.
+	let provider_node_id = node_cfgs[1].keys_manager.get_node_id(Recipient::Node).unwrap();
+	if customer_trusts_provider {
+		customer.trusted_splice_peers_0conf = vec![provider_node_id];
+	}
+	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[Some(customer), Some(provider)]);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+	let node_id_0 = nodes[0].node.get_our_node_id();
+	let node_id_1 = nodes[1].node.get_our_node_id();
+	assert_eq!(node_id_1, provider_node_id);
+
+	// The customer opens the channel with its own funds: no room to receive.
+	create_unannounced_chan_between_nodes_with_value(&nodes, 0, 1, 100_000, 0);
+	let channel = nodes[0].node.list_channels().into_iter().next().unwrap();
+	let (channel_id, original_funding_txid) =
+		(channel.channel_id, channel.funding_txo.unwrap().txid);
+	let room_before = nodes[1].node.list_channels()[0].next_outbound_htlc_limit_msat;
+
+	// The provider splices in its own coins.
+	let coinbase_tx = provide_anchor_reserves(&nodes);
+	let contribution = SpliceContribution::SpliceIn {
+		value: Amount::from_sat(200_000),
+		inputs: vec![FundingTxInput::new_p2wpkh(coinbase_tx, 1).unwrap()],
+		change_script: Some(nodes[1].wallet_source.get_change_script().unwrap()),
+	};
+	let new_funding_script =
+		complete_splice_handshake(&nodes[1], &nodes[0], channel_id, contribution.clone());
+	let initial_commit_sig = complete_interactive_funding_negotiation(
+		&nodes[1],
+		&nodes[0],
+		channel_id,
+		contribution,
+		new_funding_script,
+	);
+	let (splice_tx, splice_locked) =
+		sign_interactive_funding_tx(&nodes[1], &nodes[0], initial_commit_sig, true);
+	expect_splice_pending_event(&nodes[0], &node_id_1);
+	expect_splice_pending_event(&nodes[1], &node_id_0);
+	let (splice_locked, destination) = splice_locked.expect("the provider locks at once");
+	assert_eq!(destination, node_id_0);
+
+	if customer_trusts_provider {
+		// The customer locks too, and the channel moves to the splice without a block.
+		lock_splice(&nodes[1], &nodes[0], &splice_locked, true);
+		let channel = nodes[1].node.list_channels().into_iter().next().unwrap();
+		assert_eq!(channel.funding_txo.unwrap().txid, splice_tx.compute_txid());
+		let room_after = channel.next_outbound_htlc_limit_msat;
+		assert!(room_after > room_before + 100_000_000, "{room_before} -> {room_after}");
+		send_payment(&nodes[1], &[&nodes[0]], room_before + 50_000_000);
+	} else {
+		// Without the trust, the customer waits for the minimum depth, as upstream does.
+		nodes[0].node.handle_splice_locked(node_id_1, &splice_locked);
+		assert!(nodes[0].node.get_and_clear_pending_msg_events().is_empty());
+		check_added_monitors(&nodes[0], 0);
+		let channel = nodes[0].node.list_channels().into_iter().next().unwrap();
+		assert_eq!(channel.funding_txo.unwrap().txid, original_funding_txid);
+	}
+}
+
+#[test]
+fn test_provider_splice_into_customer_opened_channel_locks_at_zero_conf() {
+	do_test_provider_splice_into_customer_opened_channel(true);
+}
+
+#[test]
+fn test_customer_without_trust_waits_for_provider_splice_depth() {
+	do_test_provider_splice_into_customer_opened_channel(false);
 }
 
 #[test]
