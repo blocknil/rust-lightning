@@ -10904,7 +10904,9 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 		match peer_state.channel_by_id.entry(msg.channel_id) {
 			hash_map::Entry::Occupied(mut chan_entry) => {
 				let chan = chan_entry.get_mut();
-				match chan.tx_complete(msg, &self.logger) {
+				let trust_own_splice_inputs_0conf =
+					self.config.read().unwrap().trust_own_splice_inputs_0conf;
+				match chan.tx_complete(msg, trust_own_splice_inputs_0conf, &self.logger) {
 					Ok((interactive_tx_msg_send, commitment_signed)) => {
 						let persist = if interactive_tx_msg_send.is_some() || commitment_signed.is_some() {
 							NotifyOption::SkipPersistHandleEvents
