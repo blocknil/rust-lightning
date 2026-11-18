@@ -11,6 +11,8 @@
 //! applies for you.
 
 use crate::ln::channel::MAX_FUNDING_SATOSHIS_NO_WUMBO;
+use bitcoin::secp256k1::PublicKey;
+
 use crate::ln::channelmanager::{BREAKDOWN_TIMEOUT, MAX_LOCAL_BREAKDOWN_TIMEOUT};
 
 #[cfg(fuzzing)]
@@ -1007,6 +1009,20 @@ pub struct UserConfig {
 	///
 	/// (Blocknil patch.)
 	pub trust_own_splice_inputs_0conf: bool,
+	/// Peers whose splices we lock at zero confirmations, whatever inputs they added.
+	///
+	/// By default a splice must reach the channel's minimum depth before it is locked, unless the
+	/// channel itself was accepted from a trusted peer at zero confirmations (in which case that
+	/// trust already covers its splices). This extends the same trust to the splices of channels
+	/// we opened ourselves to these peers: a wallet whose Lightning service provider adds funds to
+	/// the wallet's channel can use them at once. Only list a peer you would accept a
+	/// zero-confirmation channel from: it could double-spend its own inputs before the splice
+	/// confirms.
+	///
+	/// Default value: empty.
+	///
+	/// (Blocknil patch.)
+	pub trusted_splice_peers_0conf: Vec<PublicKey>,
 }
 
 impl Default for UserConfig {
@@ -1026,6 +1042,7 @@ impl Default for UserConfig {
 			hold_outbound_htlcs_at_next_hop: false,
 			reject_inbound_splices: true,
 			trust_own_splice_inputs_0conf: false,
+			trusted_splice_peers_0conf: Vec::new(),
 		}
 	}
 }
@@ -1064,6 +1081,8 @@ impl Readable for UserConfig {
 			enable_htlc_hold,
 			reject_inbound_splices,
 			trust_own_splice_inputs_0conf,
+			// Not fuzzed: a list of node ids adds nothing the boolean doesn't.
+			trusted_splice_peers_0conf: Vec::new(),
 		})
 	}
 }
