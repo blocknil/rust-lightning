@@ -2660,6 +2660,8 @@ where
 //  |
 //  |__`pending_intercepted_htlcs`
 //  |
+//  |__`intercepts_in_flight`, `handed_back_intercepts` (Blocknil patch; leaves, also taken under `peer_state`)
+//  |
 //  |__`decode_update_add_htlcs`
 //  |
 //  |__`per_peer_state`
@@ -2760,6 +2762,24 @@ pub struct ChannelManager<
 	///
 	/// See `ChannelManager` struct-level documentation for lock order requirements.
 	pending_intercepted_htlcs: Mutex<HashMap<InterceptId, PendingAddHTLCInfo>>,
+
+	/// Blocknil patch: intercepted HTLCs handed to [`ChannelManager::forward_intercepted_htlc`]
+	/// and not processed yet, as they were intercepted. If processing the forward finds the next
+	/// peer disconnected, the HTLC is intercepted again from this copy (a new
+	/// [`Event::HTLCIntercepted`] with the same id and amounts) instead of being failed back to
+	/// the payer: an LSP forwards a first payment the moment its just-in-time channel is ready, and
+	/// a phone that drops the connection right then (within milliseconds) is usually back within a
+	/// second. In memory only: after a restart in between, the forward fails back as before.
+	///
+	/// Lock order: a leaf; nothing else is locked while it is held.
+	intercepts_in_flight: Mutex<HashMap<InterceptId, PerSourcePendingForward>>,
+
+	/// Blocknil patch: intercept ids handed back that way and not yet asked about through
+	/// [`ChannelManager::take_handed_back_intercept`], so the handler of the new
+	/// [`Event::HTLCIntercepted`] can tell a returned HTLC from a new one. In memory only.
+	///
+	/// Lock order: a leaf, like `intercepts_in_flight`.
+	handed_back_intercepts: Mutex<HashSet<InterceptId>>,
 
 	/// Outbound SCID Alias -> pending `update_add_htlc`s to decode.
 	/// We use the scid alias because regular scids may change if a splice occurs.
@@ -4084,6 +4104,8 @@ where
 			decode_update_add_htlcs: Mutex::new(new_hash_map()),
 			claimable_payments: Mutex::new(ClaimablePayments { claimable_payments: new_hash_map(), pending_claiming_payments: new_hash_map() }),
 			pending_intercepted_htlcs: Mutex::new(new_hash_map()),
+			intercepts_in_flight: Mutex::new(new_hash_map()),
+			handed_back_intercepts: Mutex::new(new_hash_set()),
 			short_to_chan_info: FairRwLock::new(new_hash_map()),
 
 			our_network_pubkey,
@@ -6888,6 +6910,8 @@ where
 	) -> Result<(), APIError> {
 		let _persistence_guard = PersistenceNotifierGuard::notify_on_drop(self);
 
+		// Blocknil patch: whether the next peer is connected now (see `intercepts_in_flight`).
+		let next_peer_connected;
 		let outbound_scid_alias = {
 			let peer_state_lock = self.per_peer_state.read().unwrap();
 			let peer_state_mutex =
@@ -6908,6 +6932,7 @@ where
 								),
 							});
 						}
+						next_peer_connected = funded_chan.context.is_live();
 						funded_chan.context.outbound_scid_alias()
 					} else {
 						return Err(APIError::ChannelUnavailable {
@@ -6941,6 +6966,32 @@ where
 			.ok_or_else(|| APIError::APIMisuseError {
 				err: format!("Payment with intercept id {} not found", log_bytes!(intercept_id.0)),
 			})?;
+
+		// Blocknil patch: keep the HTLC as it was intercepted, to intercept it again if the next
+		// peer drops between this call and the forward being processed (see
+		// `intercepts_in_flight`). Only if the peer is connected now: a forward to a peer that is
+		// already gone fails back as before, so a caller that forwards at once on every
+		// interception (LSPS2 after its first payment) cannot loop while the peer is away; each
+		// further hand-back needs the peer to have been connected again.
+		if next_peer_connected {
+			let mut in_flight = self.intercepts_in_flight.lock().unwrap();
+			let previous = in_flight.insert(
+				intercept_id,
+				(
+					payment.prev_outbound_scid_alias,
+					payment.prev_counterparty_node_id,
+					payment.prev_funding_outpoint,
+					payment.prev_channel_id,
+					payment.prev_user_channel_id,
+					vec![(payment.forward_info.clone(), payment.prev_htlc_id)],
+				),
+			);
+			// One intercept id, two HTLCs: never guess which copy is which; neither is kept.
+			if previous.is_some() {
+				debug_assert!(false, "two in-flight intercepted HTLCs with one intercept id");
+				in_flight.remove(&intercept_id);
+			}
+		}
 
 		let routing = match payment.forward_info.routing {
 			PendingHTLCRouting::Forward {
@@ -6980,6 +7031,15 @@ where
 		)];
 		self.forward_htlcs(&mut per_source_pending_forward);
 		Ok(())
+	}
+
+	/// Blocknil patch: whether the [`Event::HTLCIntercepted`] for `intercept_id` is an HTLC
+	/// handed back because its forward found the next peer disconnected (see
+	/// [`ChannelManager::forward_intercepted_htlc`]) rather than a new one. Answers `true` once
+	/// per hand-back; call it for every `HTLCIntercepted` event so nothing is left behind. A
+	/// restart between the hand-back and this call answers `false`.
+	pub fn take_handed_back_intercept(&self, intercept_id: InterceptId) -> bool {
+		self.handed_back_intercepts.lock().unwrap().remove(&intercept_id)
 	}
 
 	/// Returns the amount received for an intercepted HTLC while it is pending.
@@ -7381,6 +7441,13 @@ where
 		for forward_info in forward_infos {
 			match forward_info {
 				HTLCForwardInfo::AddHTLC(payment) => {
+					// Blocknil patch: the channel is gone, so this fails back as before; drop the
+					// copy kept for intercepting it again (see `intercepts_in_flight`).
+					self.intercepts_in_flight.lock().unwrap().remove(
+						&InterceptId::from_incoming_shared_secret(
+							&payment.forward_info.incoming_shared_secret,
+						),
+					);
 					let PendingAddHTLCInfo {
 						prev_outbound_scid_alias,
 						prev_htlc_id,
@@ -7602,6 +7669,13 @@ where
 			let queue_fail_htlc_res = match forward_info {
 				HTLCForwardInfo::AddHTLC(ref payment) => {
 					let htlc_source = HTLCSource::PreviousHopData(payment.htlc_previous_hop_data());
+					// Blocknil patch: whether this forward is an intercepted HTLC (see
+					// `intercepts_in_flight`); taken here so the copy never outlives the forward.
+					let intercepted_original = self.intercepts_in_flight.lock().unwrap().remove(
+						&InterceptId::from_incoming_shared_secret(
+							&payment.forward_info.incoming_shared_secret,
+						),
+					);
 					let PendingAddHTLCInfo {
 						prev_outbound_scid_alias,
 						forward_info:
@@ -7716,6 +7790,35 @@ where
 							&counterparty_node_id,
 							msg
 						);
+
+						// Blocknil patch: an intercepted HTLC whose next peer is disconnected is
+						// intercepted again rather than failed back (see `intercepts_in_flight`).
+						// Nothing was added to the channel, so there is no outbound HTLC to undo.
+						// `phantom_receives` is handed to `forward_htlcs` once no lock is held,
+						// which intercepts it as it did the first time.
+						// The copy must be of this very HTLC (same incoming channel and HTLC id):
+						// anything else fails back as before.
+						let same_htlc = intercepted_original.as_ref().map_or(false, |o| {
+							o.3 == payment.prev_channel_id
+								&& o.5.len() == 1 && o.5[0].1 == payment.prev_htlc_id
+						});
+						if reason == LocalHTLCFailureReason::PeerOffline && same_htlc {
+							if let Some(original) = intercepted_original {
+								log_info!(
+									logger,
+									"Peer {} disconnected before the intercepted HTLC with payment_hash {} could be forwarded: intercepting it again",
+									&counterparty_node_id,
+									&payment_hash
+								);
+								self.handed_back_intercepts.lock().unwrap().insert(
+									InterceptId::from_incoming_shared_secret(
+										&payment.forward_info.incoming_shared_secret,
+									),
+								);
+								phantom_receives.push(original);
+								continue;
+							}
+						}
 
 						if let Some(chan) = peer_state
 							.channel_by_id
@@ -18409,6 +18512,8 @@ where
 			inbound_payment_key: expanded_inbound_key,
 			pending_outbound_payments: pending_outbounds,
 			pending_intercepted_htlcs: Mutex::new(pending_intercepted_htlcs.unwrap()),
+			intercepts_in_flight: Mutex::new(new_hash_map()),
+			handed_back_intercepts: Mutex::new(new_hash_set()),
 
 			forward_htlcs: Mutex::new(forward_htlcs),
 			decode_update_add_htlcs: Mutex::new(decode_update_add_htlcs),

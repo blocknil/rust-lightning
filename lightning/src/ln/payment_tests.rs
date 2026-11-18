@@ -2248,6 +2248,365 @@ fn test_holding_cell_inflight_htlcs() {
 }
 
 #[test]
+fn an_intercepted_htlc_forwarded_to_a_peer_already_gone_fails_back_as_before() {
+	// Blocknil patch. Only a peer that drops between `forward_intercepted_htlc` and the forward
+	// being processed gets the HTLC handed back. A forward to a peer that is already gone fails
+	// back as before: a caller that forwards at once on every interception (LSPS2 once its first
+	// payment went through) would otherwise forward and get it back in a loop while they are away.
+	let chanmon_cfgs = create_chanmon_cfgs(3);
+	let node_cfgs = create_node_cfgs(3, &chanmon_cfgs);
+
+	let mut zero_conf_chan_config = test_default_channel_config();
+	zero_conf_chan_config.manually_accept_inbound_channels = true;
+	let mut intercept_forwards_config = test_default_channel_config();
+	intercept_forwards_config.accept_intercept_htlcs = true;
+
+	let configs = [None, Some(intercept_forwards_config), Some(zero_conf_chan_config)];
+	let node_chanmgrs = create_node_chanmgrs(3, &node_cfgs, &configs);
+	let nodes = create_network(3, &node_cfgs, &node_chanmgrs);
+
+	let node_a_id = nodes[0].node.get_our_node_id();
+	let node_b_id = nodes[1].node.get_our_node_id();
+	let node_c_id = nodes[2].node.get_our_node_id();
+
+	let scorer = test_utils::TestScorer::new();
+	let random_seed_bytes = chanmon_cfgs[0].keys_manager.get_secure_random_bytes();
+	let _ = create_announced_chan_between_nodes(&nodes, 0, 1).2;
+
+	let amt_msat = 100_000;
+	let intercept_scid = nodes[1].node.get_intercept_scid();
+	let payment_params = PaymentParameters::from_node_id(node_c_id, TEST_FINAL_CLTV)
+		.with_route_hints(vec![RouteHint(vec![RouteHintHop {
+			src_node_id: node_b_id,
+			short_channel_id: intercept_scid,
+			fees: RoutingFees { base_msat: 1000, proportional_millionths: 0 },
+			cltv_expiry_delta: MIN_CLTV_EXPIRY_DELTA,
+			htlc_minimum_msat: None,
+			htlc_maximum_msat: None,
+		}])])
+		.unwrap()
+		.with_bolt11_features(nodes[2].node.bolt11_invoice_features())
+		.unwrap();
+	let route_params = RouteParameters::from_payment_params_and_value(payment_params, amt_msat);
+	let route = get_route(
+		&node_a_id,
+		&route_params,
+		&nodes[0].network_graph.read_only(),
+		None,
+		nodes[0].logger,
+		&scorer,
+		&Default::default(),
+		&random_seed_bytes,
+	)
+	.unwrap();
+
+	let (hash, payment_secret) =
+		nodes[2].node.create_inbound_payment(Some(amt_msat), 60 * 60, None).unwrap();
+	let onion = RecipientOnionFields::secret_only(payment_secret);
+	nodes[0].node.send_payment_with_route(route, hash, onion, PaymentId(hash.0)).unwrap();
+	check_added_monitors(&nodes[0], 1);
+	let payment_event = SendEvent::from_node(&nodes[0]);
+	nodes[1].node.handle_update_add_htlc(node_a_id, &payment_event.msgs[0]);
+	commitment_signed_dance!(nodes[1], nodes[0], &payment_event.commitment_msg, false, true);
+	expect_and_process_pending_htlcs(&nodes[1], false);
+
+	let events = nodes[1].node.get_and_clear_pending_events();
+	assert_eq!(events.len(), 1);
+	let (intercept_id, outbound_amt) = match events[0] {
+		Event::HTLCIntercepted { intercept_id, expected_outbound_amount_msat, .. } => {
+			(intercept_id, expected_outbound_amount_msat)
+		},
+		_ => panic!("Unexpected event"),
+	};
+
+	let (_, chan_id) = open_zero_conf_channel(&nodes[1], &nodes[2], None);
+	nodes[1].node.peer_disconnected(node_c_id);
+	nodes[2].node.peer_disconnected(node_b_id);
+	nodes[1].node.forward_intercepted_htlc(intercept_id, &chan_id, node_c_id, outbound_amt).unwrap();
+	nodes[1].node.process_pending_htlc_forwards();
+	let events = nodes[1].node.get_and_clear_pending_events();
+	assert!(
+		events.iter().all(|e| !matches!(e, Event::HTLCIntercepted { .. })),
+		"handed back while the peer was already gone: {events:?}"
+	);
+	assert!(
+		events.iter().any(|e| matches!(e, Event::HTLCHandlingFailed { .. })),
+		"not failed back: {events:?}"
+	);
+	nodes[1].node.process_pending_htlc_forwards();
+	check_added_monitors(&nodes[1], 1);
+	let htlc_fail = get_htlc_update_msgs!(nodes[1], node_a_id);
+	assert_eq!(htlc_fail.update_fail_htlcs.len(), 1);
+}
+
+#[test]
+fn intercepted_htlc_forward_to_a_disconnected_peer_is_intercepted_again() {
+	// Blocknil patch (red test first). An LSP forwards an intercepted HTLC into a just-in-time
+	// channel the moment the channel is ready. If the recipient disconnects between that call and
+	// the forward being processed (seen at ~30 ms when a phone's background run is cancelled), the
+	// forward fails with "Cannot send an HTLC while disconnected" and the HTLC is failed back to
+	// the payer, although the channel is open and the recipient is usually back within a second.
+	// An intercepted HTLC should instead be handed back to the LSP as intercepted again, so it can
+	// forward it once the recipient reconnects (or fail it itself).
+	let chanmon_cfgs = create_chanmon_cfgs(3);
+	let node_cfgs = create_node_cfgs(3, &chanmon_cfgs);
+
+	let mut zero_conf_chan_config = test_default_channel_config();
+	zero_conf_chan_config.manually_accept_inbound_channels = true;
+	let mut intercept_forwards_config = test_default_channel_config();
+	intercept_forwards_config.accept_intercept_htlcs = true;
+
+	let configs = [None, Some(intercept_forwards_config), Some(zero_conf_chan_config)];
+	let node_chanmgrs = create_node_chanmgrs(3, &node_cfgs, &configs);
+	let nodes = create_network(3, &node_cfgs, &node_chanmgrs);
+
+	let node_a_id = nodes[0].node.get_our_node_id();
+	let node_b_id = nodes[1].node.get_our_node_id();
+	let node_c_id = nodes[2].node.get_our_node_id();
+
+	let scorer = test_utils::TestScorer::new();
+	let random_seed_bytes = chanmon_cfgs[0].keys_manager.get_secure_random_bytes();
+	let _ = create_announced_chan_between_nodes(&nodes, 0, 1).2;
+
+	let amt_msat = 100_000;
+	let intercept_scid = nodes[1].node.get_intercept_scid();
+	let payment_params = PaymentParameters::from_node_id(node_c_id, TEST_FINAL_CLTV)
+		.with_route_hints(vec![RouteHint(vec![RouteHintHop {
+			src_node_id: node_b_id,
+			short_channel_id: intercept_scid,
+			fees: RoutingFees { base_msat: 1000, proportional_millionths: 0 },
+			cltv_expiry_delta: MIN_CLTV_EXPIRY_DELTA,
+			htlc_minimum_msat: None,
+			htlc_maximum_msat: None,
+		}])])
+		.unwrap()
+		.with_bolt11_features(nodes[2].node.bolt11_invoice_features())
+		.unwrap();
+	let route_params = RouteParameters::from_payment_params_and_value(payment_params, amt_msat);
+	let route = get_route(
+		&node_a_id,
+		&route_params,
+		&nodes[0].network_graph.read_only(),
+		None,
+		nodes[0].logger,
+		&scorer,
+		&Default::default(),
+		&random_seed_bytes,
+	)
+	.unwrap();
+
+	let (hash, payment_secret) =
+		nodes[2].node.create_inbound_payment(Some(amt_msat), 60 * 60, None).unwrap();
+	let onion = RecipientOnionFields::secret_only(payment_secret);
+	nodes[0].node.send_payment_with_route(route, hash, onion, PaymentId(hash.0)).unwrap();
+	check_added_monitors(&nodes[0], 1);
+	let payment_event = SendEvent::from_node(&nodes[0]);
+	nodes[1].node.handle_update_add_htlc(node_a_id, &payment_event.msgs[0]);
+	commitment_signed_dance!(nodes[1], nodes[0], &payment_event.commitment_msg, false, true);
+	expect_and_process_pending_htlcs(&nodes[1], false);
+
+	let events = nodes[1].node.get_and_clear_pending_events();
+	assert_eq!(events.len(), 1);
+	let (intercept_id, outbound_amt) = match events[0] {
+		Event::HTLCIntercepted { intercept_id, expected_outbound_amount_msat, .. } => {
+			(intercept_id, expected_outbound_amount_msat)
+		},
+		_ => panic!("Unexpected event"),
+	};
+
+	// The just-in-time channel becomes ready and the LSP forwards at once, while the recipient is
+	// still connected.
+	let (_, chan_id) = open_zero_conf_channel(&nodes[1], &nodes[2], None);
+	nodes[1].node.forward_intercepted_htlc(intercept_id, &chan_id, node_c_id, outbound_amt).unwrap();
+
+	// The recipient drops before the forward is processed.
+	nodes[1].node.peer_disconnected(node_c_id);
+	nodes[2].node.peer_disconnected(node_b_id);
+	nodes[1].node.process_pending_htlc_forwards();
+
+	// Nothing is failed back to the payer...
+	let events = nodes[1].node.get_and_clear_pending_events();
+	assert!(
+		!events.iter().any(|e| matches!(e, Event::HTLCHandlingFailed { .. })),
+		"the HTLC was failed back: {events:?}"
+	);
+	assert!(
+		nodes[1].node.get_and_clear_pending_msg_events().iter().all(|e| !matches!(
+			e,
+			MessageSendEvent::UpdateHTLCs { node_id, .. } if *node_id == node_a_id
+		)),
+		"an update was sent to the payer"
+	);
+	// ...the LSP gets the HTLC back as intercepted, with the same id and amount...
+	let (again_id, again_amt) = match events.as_slice() {
+		[Event::HTLCIntercepted { intercept_id, expected_outbound_amount_msat, .. }] => {
+			(*intercept_id, *expected_outbound_amount_msat)
+		},
+		_ => panic!("expected one HTLCIntercepted, got {events:?}"),
+	};
+	assert_eq!((again_id, again_amt), (intercept_id, outbound_amt));
+	// The handler can tell it is the same HTLC coming back, once.
+	assert!(nodes[1].node.take_handed_back_intercept(again_id));
+	assert!(!nodes[1].node.take_handed_back_intercept(again_id));
+	// Nothing went out on the channel, so forwarding it again cannot pay the recipient twice.
+	let to_c = nodes[1].node.list_channels_with_counterparty(&node_c_id);
+	assert_eq!(to_c.len(), 1);
+	assert!(to_c[0].pending_outbound_htlcs.is_empty(), "{:?}", to_c[0].pending_outbound_htlcs);
+
+	// ...and once the recipient is back it forwards it, and the payment completes.
+	// The zero-conf channel has carried no update yet, so both sides resend `channel_ready`.
+	let mut reconnect = ReconnectArgs::new(&nodes[1], &nodes[2]);
+	reconnect.send_channel_ready = (true, true);
+	reconnect_nodes(reconnect);
+	nodes[1].node.forward_intercepted_htlc(again_id, &chan_id, node_c_id, again_amt).unwrap();
+	expect_and_process_pending_htlcs(&nodes[1], false);
+	check_added_monitors(&nodes[1], 1);
+	let payment_event = SendEvent::from_node(&nodes[1]);
+	nodes[2].node.handle_update_add_htlc(node_b_id, &payment_event.msgs[0]);
+	commitment_signed_dance!(nodes[2], nodes[1], &payment_event.commitment_msg, false, true);
+	expect_and_process_pending_htlcs(&nodes[2], false);
+	let preimage = Some(nodes[2].node.get_payment_preimage(hash, payment_secret).unwrap());
+	expect_payment_claimable!(&nodes[2], hash, payment_secret, amt_msat, preimage, node_c_id);
+	let path: &[&[_]] = &[&[&nodes[1], &nodes[2]]];
+	do_claim_payment_along_route(ClaimAlongRouteArgs::new(&nodes[0], path, preimage.unwrap()));
+	expect_payment_sent!(&nodes[0], preimage.unwrap());
+}
+
+#[test]
+fn an_intercepted_htlc_handed_back_and_never_forwarded_fails_back_at_its_deadline() {
+	// Blocknil patch. An HTLC intercepted again because its recipient was disconnected (see
+	// `intercepted_htlc_forward_to_a_disconnected_peer_is_intercepted_again`) and then never
+	// forwarded is failed back by the intercept deadline like any intercepted HTLC: holding it never
+	// outlives what the payer's HTLC allows.
+	let chanmon_cfgs = create_chanmon_cfgs(3);
+	let node_cfgs = create_node_cfgs(3, &chanmon_cfgs);
+
+	let mut zero_conf_chan_config = test_default_channel_config();
+	zero_conf_chan_config.manually_accept_inbound_channels = true;
+	let mut intercept_forwards_config = test_default_channel_config();
+	intercept_forwards_config.accept_intercept_htlcs = true;
+
+	let configs = [None, Some(intercept_forwards_config), Some(zero_conf_chan_config)];
+	let node_chanmgrs = create_node_chanmgrs(3, &node_cfgs, &configs);
+	let nodes = create_network(3, &node_cfgs, &node_chanmgrs);
+
+	let node_a_id = nodes[0].node.get_our_node_id();
+	let node_b_id = nodes[1].node.get_our_node_id();
+	let node_c_id = nodes[2].node.get_our_node_id();
+
+	let scorer = test_utils::TestScorer::new();
+	let random_seed_bytes = chanmon_cfgs[0].keys_manager.get_secure_random_bytes();
+	let _ = create_announced_chan_between_nodes(&nodes, 0, 1).2;
+
+	let amt_msat = 100_000;
+	let intercept_scid = nodes[1].node.get_intercept_scid();
+	let payment_params = PaymentParameters::from_node_id(node_c_id, TEST_FINAL_CLTV)
+		.with_route_hints(vec![RouteHint(vec![RouteHintHop {
+			src_node_id: node_b_id,
+			short_channel_id: intercept_scid,
+			fees: RoutingFees { base_msat: 1000, proportional_millionths: 0 },
+			cltv_expiry_delta: MIN_CLTV_EXPIRY_DELTA,
+			htlc_minimum_msat: None,
+			htlc_maximum_msat: None,
+		}])])
+		.unwrap()
+		.with_bolt11_features(nodes[2].node.bolt11_invoice_features())
+		.unwrap();
+	let route_params = RouteParameters::from_payment_params_and_value(payment_params, amt_msat);
+	let route = get_route(
+		&node_a_id,
+		&route_params,
+		&nodes[0].network_graph.read_only(),
+		None,
+		nodes[0].logger,
+		&scorer,
+		&Default::default(),
+		&random_seed_bytes,
+	)
+	.unwrap();
+
+	let (hash, payment_secret) =
+		nodes[2].node.create_inbound_payment(Some(amt_msat), 60 * 60, None).unwrap();
+	let onion = RecipientOnionFields::secret_only(payment_secret);
+	nodes[0].node.send_payment_with_route(route, hash, onion, PaymentId(hash.0)).unwrap();
+	check_added_monitors(&nodes[0], 1);
+	let payment_event = SendEvent::from_node(&nodes[0]);
+	nodes[1].node.handle_update_add_htlc(node_a_id, &payment_event.msgs[0]);
+	commitment_signed_dance!(nodes[1], nodes[0], &payment_event.commitment_msg, false, true);
+	expect_and_process_pending_htlcs(&nodes[1], false);
+
+	let events = nodes[1].node.get_and_clear_pending_events();
+	assert_eq!(events.len(), 1);
+	let (intercept_id, outbound_amt) = match events[0] {
+		Event::HTLCIntercepted { intercept_id, expected_outbound_amount_msat, .. } => {
+			(intercept_id, expected_outbound_amount_msat)
+		},
+		_ => panic!("Unexpected event"),
+	};
+
+	// The just-in-time channel becomes ready and the LSP forwards at once, while the recipient is
+	// still connected.
+	let (_, chan_id) = open_zero_conf_channel(&nodes[1], &nodes[2], None);
+	nodes[1].node.forward_intercepted_htlc(intercept_id, &chan_id, node_c_id, outbound_amt).unwrap();
+
+	// The recipient drops before the forward is processed.
+	nodes[1].node.peer_disconnected(node_c_id);
+	nodes[2].node.peer_disconnected(node_b_id);
+	nodes[1].node.process_pending_htlc_forwards();
+
+	// Nothing is failed back to the payer...
+	let events = nodes[1].node.get_and_clear_pending_events();
+	assert!(
+		!events.iter().any(|e| matches!(e, Event::HTLCHandlingFailed { .. })),
+		"the HTLC was failed back: {events:?}"
+	);
+	assert!(
+		nodes[1].node.get_and_clear_pending_msg_events().iter().all(|e| !matches!(
+			e,
+			MessageSendEvent::UpdateHTLCs { node_id, .. } if *node_id == node_a_id
+		)),
+		"an update was sent to the payer"
+	);
+	// ...the LSP gets the HTLC back as intercepted, with the same id and amount...
+	let (again_id, again_amt) = match events.as_slice() {
+		[Event::HTLCIntercepted { intercept_id, expected_outbound_amount_msat, .. }] => {
+			(*intercept_id, *expected_outbound_amount_msat)
+		},
+		_ => panic!("expected one HTLCIntercepted, got {events:?}"),
+	};
+	assert_eq!((again_id, again_amt), (intercept_id, outbound_amt));
+	// The handler can tell it is the same HTLC coming back, once.
+	assert!(nodes[1].node.take_handed_back_intercept(again_id));
+	assert!(!nodes[1].node.take_handed_back_intercept(again_id));
+	// Nothing went out on the channel, so forwarding it again cannot pay the recipient twice.
+	let to_c = nodes[1].node.list_channels_with_counterparty(&node_c_id);
+	assert_eq!(to_c.len(), 1);
+	assert!(to_c[0].pending_outbound_htlcs.is_empty(), "{:?}", to_c[0].pending_outbound_htlcs);
+
+	let mut block = create_dummy_block(nodes[0].best_block_hash(), 42, Vec::new());
+	connect_block(&nodes[0], &block);
+	connect_block(&nodes[1], &block);
+	for _ in 0..TEST_FINAL_CLTV {
+		block.header.prev_blockhash = block.block_hash();
+		connect_block(&nodes[0], &block);
+		connect_block(&nodes[1], &block);
+	}
+	let fail_type =
+		HTLCHandlingFailureType::InvalidForward { requested_forward_scid: intercept_scid };
+	expect_and_process_pending_htlcs_and_htlc_handling_failed(&nodes[1], &[fail_type]);
+	check_added_monitors!(nodes[1], 1);
+	let htlc_fail = get_htlc_update_msgs!(nodes[1], node_a_id);
+	assert_eq!(htlc_fail.update_fail_htlcs.len(), 1);
+	nodes[0].node.handle_update_fail_htlc(node_b_id, &htlc_fail.update_fail_htlcs[0]);
+	commitment_signed_dance!(nodes[0], nodes[1], htlc_fail.commitment_signed, false);
+	let reason = LocalHTLCFailureReason::TemporaryNodeFailure;
+	expect_payment_failed!(nodes[0], hash, false, reason, []);
+	// And it can no longer be forwarded.
+	let err = nodes[1].node.forward_intercepted_htlc(again_id, &chan_id, node_c_id, again_amt);
+	assert!(matches!(err, Err(APIError::APIMisuseError { .. })), "{err:?}");
+}
+
+#[test]
 fn intercepted_payment() {
 	// Test that detecting an intercept scid on payment forward will signal LDK to generate an
 	// intercept event, which the LSP can then use to either (a) open a JIT channel to forward the
