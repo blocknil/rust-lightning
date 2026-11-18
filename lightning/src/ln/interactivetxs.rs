@@ -358,6 +358,20 @@ impl ConstructedTransaction {
 		NegotiationError { reason, contributed_inputs, contributed_outputs }
 	}
 
+	/// Whether the counterparty contributed any input other than the shared funding input.
+	/// (Blocknil patch.)
+	pub(super) fn has_counterparty_contributed_inputs(&self) -> bool {
+		self.input_metadata
+			.iter()
+			.enumerate()
+			.filter(|(index, _)| {
+				self.shared_input_index
+					.map(|shared_index| *index != shared_index as usize)
+					.unwrap_or(true)
+			})
+			.any(|(_, input)| !input.is_local(self.holder_is_initiator))
+	}
+
 	fn to_contributed_inputs_and_outputs(&self) -> (Vec<BitcoinOutPoint>, Vec<TxOut>) {
 		let contributed_inputs = self
 			.tx
