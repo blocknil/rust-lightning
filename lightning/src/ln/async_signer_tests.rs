@@ -1777,7 +1777,7 @@ fn test_no_disconnect_while_async_commitment_signed_expecting_remote_revoke_and_
 }
 
 #[test]
-fn test_async_panic_on_stale_state() {
+fn test_async_close_on_stale_state() {
 	// Test that we panic if the counterparty sends us a `channel_reestablish` message with a
 	// `next_remote_commitment_number` greater than what we know with a valid corresponding secret,
 	// proving that we have lost state, when we have an async signer that is not able to immediately
@@ -1818,14 +1818,27 @@ fn test_async_panic_on_stale_state() {
 	nodes[1].node.handle_channel_reestablish(node_id_0, &reestablish_0_to_1[0]);
 
 	nodes[1].enable_channel_signer_op(&node_id_0, &chan_id, SignerOp::GetPerCommitmentPoint);
-	std::panic::catch_unwind(|| nodes[1].node.signer_unblocked(None)).unwrap_err();
+	// Blocknil patch: no panic (upstream panics here). The channel closes without broadcasting
+	// the state the peer proved revoked.
+	nodes[1].node.signer_unblocked(None);
 	nodes[1].logger.assert_log_contains(
 		"lightning::ln::channel",
-		"We have fallen behind - we have received proof that if we broadcast our counterparty is going to claim all our funds.",
+		"We have fallen behind: the peer proved our latest state is revoked.",
 		1,
 	);
-
-	std::panic::catch_unwind(|| drop(nodes)).unwrap_err();
+	assert!(
+		nodes[1].tx_broadcaster.txn_broadcasted.lock().unwrap().is_empty(),
+		"the revoked state was broadcast"
+	);
+	let events = nodes[1].node.get_and_clear_pending_events();
+	assert!(
+		events.iter().any(|e| matches!(e, Event::ChannelClosed {
+			reason: ClosureReason::ProcessingError { err }, ..
+		} if err.starts_with("We have fallen behind"))),
+		"{events:?}"
+	);
+	// Skip the `Drop` handler for `Node`s: nodes[1]'s monitor is older than the channel's state.
+	std::mem::forget(nodes);
 }
 
 #[test]

@@ -3732,6 +3732,13 @@ pub(super) struct ChannelContext<SP: SignerProvider> {
 	// indicating that our state may be stale, we set this to the received last-revoked commitment
 	// number and secret to perform the verification when the signer is ready.
 	signer_pending_stale_state_verification: Option<(u64, SecretKey)>,
+	/// Blocknil patch: set when the peer proved, in `channel_reestablish`, that our state is older
+	/// than theirs (a wallet restored from an old backup). Our latest commitment is then revoked:
+	/// broadcasting it would hand the peer the whole channel. The channel is closed without
+	/// broadcasting, the peer force-closes with its latest state, and the `ChannelMonitor` still
+	/// claims our output on their commitment, which pays our static payment key. Not persisted:
+	/// once closed, the monitor holds `should_broadcast: false`.
+	fallen_behind: bool,
 
 	// pending_update_fee is filled when sending and receiving update_fee.
 	//
@@ -4616,6 +4623,7 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 			blocked_monitor_updates: Vec::new(),
 
 			is_manual_broadcast: false,
+			fallen_behind: false,
 
 			interactive_tx_signing_session: None,
 		};
@@ -4926,6 +4934,7 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 			blocked_monitor_updates: Vec::new(),
 			local_initiated_shutdown: None,
 			is_manual_broadcast: false,
+			fallen_behind: false,
 
 			interactive_tx_signing_session: None,
 		};
@@ -6746,7 +6755,8 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 		// be delayed in being processed! See the docs for `ChannelManagerReadArgs` for more.
 		assert!(!matches!(self.channel_state, ChannelState::ShutdownComplete));
 
-		let broadcast = self.is_funding_broadcastable();
+		// Blocknil patch: never broadcast a state the peer has proven revoked (see `fallen_behind`).
+		let broadcast = self.is_funding_broadcastable() && !self.fallen_behind;
 
 		// We go ahead and "free" any holding cell HTLCs or HTLCs we haven't yet committed to and
 		// return them to fail the payment.
@@ -10539,7 +10549,7 @@ where
 				if expected_point != PublicKey::from_secret_key(&self.context.secp_ctx, &commitment_secret) {
 					return Err(ChannelError::close("Peer sent a channel_reestablish indicating we're stale with an invalid commitment secret".to_owned()));
 				}
-				Self::panic_on_stale_state(logger);
+				return Err(self.close_on_stale_state(logger));
 			}
 		}
 		if !self.holder_commitment_point.can_advance() {
@@ -10911,20 +10921,19 @@ where
 		}
 	}
 
-	fn panic_on_stale_state<L: Logger>(logger: &L) {
-		macro_rules! log_and_panic {
-			($err_msg: expr) => {
-				log_error!(logger, $err_msg);
-				panic!($err_msg);
-			};
-		}
-		log_and_panic!("We have fallen behind - we have received proof that if we broadcast our counterparty is going to claim all our funds.\n\
-			This implies you have restarted with lost ChannelMonitor and ChannelManager state, the first of which is a violation of the LDK chain::Watch requirements.\n\
-			More specifically, this means you have a bug in your implementation that can cause loss of funds, or you are running with an old backup, which is unsafe.\n\
-			If you have restored from an old backup and wish to claim any available funds, you should restart with\n\
-			an empty ChannelManager and no ChannelMonitors, reconnect to peer(s), ensure they've force-closed all of your\n\
-			previous channels and that the closure transaction(s) have confirmed on-chain,\n\
-			then restart with an empty ChannelManager and the latest ChannelMonitors that you do have.");
+	/// Blocknil patch: upstream panics when the peer proves our state is stale. On a phone that is
+	/// a wallet restored from an old channel backup, and the panic poisons the ChannelManager's
+	/// locks and aborts the app on every start, with the money stuck. Instead the channel closes
+	/// without broadcasting our revoked state (`fallen_behind`), and the peer's close returns our
+	/// funds through the ChannelMonitor.
+	fn close_on_stale_state<L: Logger>(&mut self, logger: &L) -> ChannelError {
+		self.context.fallen_behind = true;
+		let message = "We have fallen behind: the peer proved our latest state is revoked. This node \
+			was restored from an old backup. Closing without broadcasting our revoked state; the \
+			peer's close returns our funds"
+			.to_owned();
+		log_error!(logger, "{}", message);
+		ChannelError::close(message)
 	}
 
 	/// May panic if some calls other than message-handling calls (which will all Err immediately)
@@ -10973,7 +10982,7 @@ where
 				if expected_point != Some(PublicKey::from_secret_key(&self.context.secp_ctx, &given_secret)) {
 					return Err(ChannelError::close("Peer sent a channel_reestablish indicating we're stale with an invalid commitment secret".to_owned()));
 				}
-				Self::panic_on_stale_state(logger);
+				return Err(self.close_on_stale_state(logger));
 			} else if msg.next_remote_commitment_number == our_commitment_transaction {
 				let expected_point = self.holder_commitment_point.last_revoked_point()
 					.expect("The last revoked commitment point must exist when the state has advanced");
@@ -18182,6 +18191,7 @@ impl<'a, 'b, 'c, ES: EntropySource, SP: SignerProvider>
 
 				blocked_monitor_updates: blocked_monitor_updates.unwrap(),
 				is_manual_broadcast: is_manual_broadcast.unwrap_or(false),
+				fallen_behind: false,
 
 				interactive_tx_signing_session,
 			},
