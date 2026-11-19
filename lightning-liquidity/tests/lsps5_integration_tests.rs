@@ -1845,3 +1845,47 @@ fn lsps5_service_persist_resets_in_flight_counter_on_io_error() {
 		res2,
 	);
 }
+
+#[test]
+fn test_payment_incoming_cooldown_is_ten_seconds() {
+	// Blocknil patch: a payment held for an offline client waits less than a minute, so a second
+	// payment to the same client must be able to wake it ten seconds after the first, not sixty.
+	let mock_time_provider = Arc::new(MockTimeProvider::new(1000));
+	let time_provider = Arc::<MockTimeProvider>::clone(&mock_time_provider);
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+	let (lsps_nodes, _) = lsps5_test_setup(nodes, time_provider);
+	let LSPSNodes { service_node, client_node } = lsps_nodes;
+	create_chan_between_nodes(&service_node.inner, &client_node.inner);
+	let service_node_id = service_node.inner.node.get_our_node_id();
+	let client_node_id = client_node.inner.node.get_our_node_id();
+
+	let client_handler = client_node.liquidity_manager.lsps5_client_handler().unwrap();
+	let service_handler = service_node.liquidity_manager.lsps5_service_handler().unwrap();
+	let _ = client_handler
+		.set_webhook(service_node_id, "App".to_string(), "https://www.example.org/wake".to_string())
+		.unwrap();
+	let set_req = get_lsps_message!(client_node, service_node_id);
+	service_node.liquidity_manager.handle_custom_message(set_req, client_node_id).unwrap();
+	let _ = service_node.liquidity_manager.next_event().unwrap();
+	let resp = get_lsps_message!(service_node, client_node_id);
+	client_node.liquidity_manager.handle_custom_message(resp, service_node_id).unwrap();
+	let _ = client_node.liquidity_manager.next_event().unwrap();
+
+	assert_eq!(NOTIFICATION_COOLDOWN_TIME, Duration::from_secs(10));
+	service_handler.notify_payment_incoming(client_node_id).unwrap();
+	assert!(service_node.liquidity_manager.next_event().is_some());
+
+	mock_time_provider.advance_time(9);
+	assert_eq!(
+		service_handler.notify_payment_incoming(client_node_id).unwrap_err(),
+		LSPS5ProtocolError::SlowDownError
+	);
+	assert!(service_node.liquidity_manager.next_event().is_none());
+
+	mock_time_provider.advance_time(2);
+	service_handler.notify_payment_incoming(client_node_id).unwrap();
+	assert!(service_node.liquidity_manager.next_event().is_some(), "woken again after 11 s");
+}

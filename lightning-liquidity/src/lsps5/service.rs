@@ -83,8 +83,18 @@ pub struct LSPS5ServiceConfig {
 
 /// Default maximum number of webhooks allowed per client.
 pub const DEFAULT_MAX_WEBHOOKS_PER_CLIENT: u32 = 10;
-/// Default notification cooldown time in minutes.
-pub const NOTIFICATION_COOLDOWN_TIME: Duration = Duration::from_secs(60); // 1 minute
+/// Shortest time between two webhook notifications to the same client.
+///
+/// Blocknil patch: upstream holds every client to one notification a minute. Our payments for an
+/// offline client are held for 90 s at most, so a client receiving two payments within a minute (a
+/// tip jar, two payers at once) would get no wake-up for the second.
+///
+/// Ten seconds is not a spam defence: holding a payment costs the payer nothing, so anyone with a
+/// channel can push a client once every ten seconds for as long as their payments keep arriving.
+/// What bounds it is this floor per client, the push relay's own per-device rate limit, the fact
+/// that only clients with a channel can register at all, and the client's ability to remove the
+/// webhook.
+pub const NOTIFICATION_COOLDOWN_TIME: Duration = Duration::from_secs(10);
 /// Minimum time between peer lifecycle events that are allowed to reset notification cooldowns.
 ///
 /// This is distinct from [`NOTIFICATION_COOLDOWN_TIME`]: that cooldown protects the client from
