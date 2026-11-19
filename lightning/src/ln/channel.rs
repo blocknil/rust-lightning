@@ -12444,6 +12444,19 @@ where
 				candidates.filter_map(|candidate| candidate.contribution).collect();
 			core::mem::swap(&mut self.funding, &mut promoted_candidate.funding);
 
+			// Blocknil patch (ported to 0.3 for the spike): raise a private channel's
+			// HTLC-value-in-flight limits to its new full value, on both sides, when a splice is
+			// promoted. They are fixed in msat at open and nothing else raises them.
+			if !self.context.should_announce() {
+				let full_msat = self.funding.get_value_satoshis() * 1000;
+				if self.context.holder_max_htlc_value_in_flight_msat < full_msat {
+					self.context.holder_max_htlc_value_in_flight_msat = full_msat;
+				}
+				if self.context.counterparty_max_htlc_value_in_flight_msat < full_msat {
+					self.context.counterparty_max_htlc_value_in_flight_msat = full_msat;
+				}
+			}
+
 			(queued_splice_failed, earlier_contributions, later_contributions)
 		};
 
