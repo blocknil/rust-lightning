@@ -17519,3 +17519,46 @@ fn test_default_splice_min_depth_on_zero_conf_channel() {
 		node.chain_source.remove_watched_by_txid(prev_funding_txid);
 	}
 }
+
+#[test]
+fn test_splice_raises_private_channel_htlc_in_flight_limits() {
+	// Blocknil patch: the HTLC-value-in-flight limits are fixed in msat when a channel opens. Unless
+	// a splice raises them, a private channel that opened small can never carry a payment larger
+	// than its opening value, however much is spliced in.
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+
+	let initial_channel_value_sat = 100_000;
+	create_unannounced_chan_between_nodes_with_value(&nodes, 0, 1, initial_channel_value_sat, 0);
+	let channel_id = nodes[0].node.list_channels()[0].channel_id;
+
+	let added_value = Amount::from_sat(initial_channel_value_sat * 2);
+	provide_utxo_reserves(&nodes, 2, added_value * 3 / 4);
+	let funding_contribution = do_initiate_splice_in(&nodes[0], &nodes[1], channel_id, added_value);
+	let (splice_tx, _) = splice_channel(&nodes[0], &nodes[1], channel_id, funding_contribution);
+	mine_transaction(&nodes[0], &splice_tx);
+	mine_transaction(&nodes[1], &splice_tx);
+	connect_blocks(&nodes[0], ANTI_REORG_DELAY - 1);
+	connect_blocks(&nodes[1], ANTI_REORG_DELAY - 1);
+	let splice_locked = get_event_msg!(
+		nodes[0],
+		MessageSendEvent::SendSpliceLocked,
+		nodes[1].node.get_our_node_id()
+	);
+	// A private channel sends no `announcement_signatures`, which `is_0conf` also skips.
+	lock_splice(&nodes[0], &nodes[1], &splice_locked, true, &[]);
+
+	let channel = nodes[0].node.list_channels()[0].clone();
+	// At least what was added: a remainder too small for a change output goes into the channel.
+	assert!(channel.channel_value_satoshis >= initial_channel_value_sat * 3);
+	// One and a half times the opening value: more than the old limits allow, well within the new.
+	let payment_msat = initial_channel_value_sat * 1000 * 3 / 2;
+	assert!(
+		channel.next_outbound_htlc_limit_msat >= payment_msat,
+		"outbound limit {} msat after the splice",
+		channel.next_outbound_htlc_limit_msat
+	);
+	send_payment(&nodes[0], &[&nodes[1]], payment_msat);
+}
