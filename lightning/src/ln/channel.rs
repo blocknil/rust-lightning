@@ -12446,6 +12446,23 @@ where
 				candidates.filter_map(|candidate| candidate.contribution).collect();
 			core::mem::swap(&mut self.funding, &mut promoted_candidate.funding);
 
+			// Blocknil patch: the HTLC-value-in-flight limits are fixed in msat when a channel
+			// opens and nothing raises them when a splice grows it, so a channel that opened small
+			// (a just-in-time one, say) could never take a larger payment however much was spliced
+			// in. Every private channel in our system is opened at 100% of its value on both sides,
+			// so both sides raise both limits to the new full value here, at the same point of the
+			// splice, and stay in agreement. Only for private channels, where both peers run this
+			// patch: an unpatched peer would keep its old limit and fail the channel if we sent more.
+			if !self.context.should_announce() {
+				let full_msat = self.funding.get_value_satoshis() * 1000;
+				if self.context.holder_max_htlc_value_in_flight_msat < full_msat {
+					self.context.holder_max_htlc_value_in_flight_msat = full_msat;
+				}
+				if self.context.counterparty_max_htlc_value_in_flight_msat < full_msat {
+					self.context.counterparty_max_htlc_value_in_flight_msat = full_msat;
+				}
+			}
+
 			(queued_splice_failed, earlier_contributions, later_contributions)
 		};
 
