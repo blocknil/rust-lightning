@@ -14,9 +14,10 @@ use lightning_transaction_sync::EsploraSyncClient;
 use lightning_macros::maybe_await;
 
 use bitcoin::block::Header;
+use bitcoin::consensus::encode::deserialize_hex;
 use bitcoin::constants::genesis_block;
 use bitcoin::network::Network;
-use bitcoin::{Amount, BlockHash, Txid};
+use bitcoin::{Amount, BlockHash, Transaction, Txid};
 
 use bitcoind::BitcoinD;
 use electrsd::ElectrsD;
@@ -44,6 +45,20 @@ pub fn setup_bitcoind_and_electrsd() -> (BitcoinD, ElectrsD) {
 	electrsd_conf.network = "regtest";
 	let electrsd = ElectrsD::with_conf(electrs_exe, &bitcoind, &electrsd_conf).unwrap();
 	(bitcoind, electrsd)
+}
+
+/// A transaction in bitcoind's wallet, and the block it confirmed in if it did.
+///
+/// Read with a raw `gettransaction` rather than the typed client call: that call's model is the
+/// one for the Bitcoin Core version this crate's `bitcoind` feature names, and a newer Core (32
+/// no longer returns `bip125-replaceable`) fails to deserialize there before any assertion runs.
+/// Only the two fields used here are read, so the suite runs on the Core version production runs.
+pub fn get_wallet_transaction(bitcoind: &BitcoinD, txid: Txid) -> (Transaction, Option<BlockHash>) {
+	let res: bitcoind::serde_json::Value =
+		bitcoind.client.call("gettransaction", &[txid.to_string().into()]).unwrap();
+	let tx = deserialize_hex(res["hex"].as_str().expect("gettransaction returns hex")).unwrap();
+	let block_hash = res["blockhash"].as_str().map(|hash| hash.parse().unwrap());
+	(tx, block_hash)
 }
 
 pub fn generate_blocks_and_wait(bitcoind: &BitcoinD, electrsd: &ElectrsD, num: usize) {
@@ -209,12 +224,10 @@ macro_rules! test_syncing {
 		assert!($confirmable.unconfirmed_txs.lock().unwrap().is_empty());
 
 		// Now take an arbitrary output of the second transaction and check we'll confirm its spend.
-		let tx_res = $bitcoind.client.get_transaction(second_txid).unwrap().into_model().unwrap();
-		let block_hash = tx_res.block_hash.unwrap();
-		let tx = tx_res.tx;
+		let (tx, block_hash) = get_wallet_transaction(&$bitcoind, second_txid);
+		let block_hash = block_hash.unwrap();
 		let prev_outpoint = tx.input.first().unwrap().previous_output;
-		let prev_tx =
-			$bitcoind.client.get_transaction(prev_outpoint.txid).unwrap().into_model().unwrap().tx;
+		let prev_tx = get_wallet_transaction(&$bitcoind, prev_outpoint.txid).0;
 		let prev_script_pubkey = prev_tx.output[prev_outpoint.vout as usize].script_pubkey.clone();
 		let output = WatchedOutput {
 			block_hash: Some(block_hash),
@@ -360,10 +373,9 @@ fn do_test_conflicting_output_watches(sync_between_registrations: bool, bogus_fi
 		.0
 		.parse()
 		.unwrap();
-	let spend_tx = bitcoind.client.get_transaction(spend_txid).unwrap().into_model().unwrap().tx;
+	let spend_tx = get_wallet_transaction(&bitcoind, spend_txid).0;
 	let prev_outpoint = spend_tx.input[0].previous_output;
-	let prev_tx =
-		bitcoind.client.get_transaction(prev_outpoint.txid).unwrap().into_model().unwrap().tx;
+	let prev_tx = get_wallet_transaction(&bitcoind, prev_outpoint.txid).0;
 	let output = WatchedOutput {
 		block_hash: None,
 		outpoint: OutPoint { txid: prev_outpoint.txid, index: prev_outpoint.vout as u16 },
