@@ -20,7 +20,7 @@ use lightning::{log_debug, log_error, log_trace};
 use bitcoin::block::Header;
 use bitcoin::{BlockHash, Script, Transaction, Txid};
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ops::Deref;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -263,55 +263,63 @@ impl<L: Logger> ElectrumSyncClient<L> {
 		}
 	}
 
+	// Blocknil patch (rl-22): the requests below are sent in batches instead of one at a time.
+	//
+	// What is checked is unchanged: every fetched transaction is compared with the txid asked for,
+	// every Merkle proof is validated against its block header, and the tip is re-checked around
+	// each phase by `sync`. What changed is only how many times we wait on the server: before, each
+	// watched transaction cost a `transaction_get`, each confirmed one a `transaction_get_merkle`
+	// plus a `block_header`, each spend of a watched output a further `transaction_get`, and each
+	// known confirmation a `block_header`, all sequential. On a phone talking to a server ~150 ms
+	// away that was ~28 round trips and ~4.8 s on every node start for a wallet with one open and
+	// one recently closed channel (Blocknil, 2026-11-22). Batched, a sync costs a fixed ~9 round
+	// trips however many transactions are watched.
 	fn get_confirmed_transactions(
 		&self, sync_state: &SyncState,
 	) -> Result<Vec<ConfirmedTx>, InternalError> {
 		// First, check the confirmation status of registered transactions as well as the
 		// status of dependent transactions of registered outputs.
-		let mut confirmed_txs: Vec<ConfirmedTx> = Vec::new();
 		let mut watched_script_pubkeys = Vec::with_capacity(
 			sync_state.watched_transactions.len() + sync_state.watched_outputs.len(),
 		);
 		let mut watched_txs = Vec::with_capacity(sync_state.watched_transactions.len());
 
-		for (txid, watch_script_pubkeys) in &sync_state.watched_transactions {
-			match self.client.transaction_get(&txid) {
-				Ok(tx) => {
-					if tx.compute_txid() != *txid {
-						log_error!(self.logger, "Retrieved transaction for txid {} doesn't match expectations. This should not happen. Please verify server integrity.", txid);
-						return Err(InternalError::Failed);
-					}
+		let registered: Vec<_> = sync_state.watched_transactions.iter().collect();
+		let registered_txids: Vec<&Txid> = registered.iter().map(|(txid, _)| *txid).collect();
+		let fetched = self.fetch_watched_transactions(&registered_txids)?;
 
-					watched_txs.push((txid, tx.clone()));
-					// We watch an output's script_pubkey of the transaction of interest in order
-					// to retrieve the associated script history, before narrowing down our search
-					// through `filter`ing by `txid` below. Prefer a script_pubkey the transaction
-					// was registered with that actually appears in the transaction (as registered
-					// script_pubkeys may be bogus), and otherwise pick an arbitrary one, noting
-					// that electrum servers may not index OP_RETURN script_pubkeys at all.
-					let candidate_outputs =
-						tx.output.iter().filter(|output| !output.script_pubkey.is_op_return());
-					let watch_output = candidate_outputs
-						.clone()
-						.find(|output| watch_script_pubkeys.contains(&output.script_pubkey))
-						.or_else(|| candidate_outputs.clone().next())
-						.or_else(|| tx.output.iter().next());
-					if let Some(tx_out) = watch_output {
-						watched_script_pubkeys.push(tx_out.script_pubkey.clone());
-					} else {
-						debug_assert!(false, "Failed due to retrieving invalid tx data.");
-						log_error!(self.logger, "Failed due to retrieving invalid tx data.");
-						return Err(InternalError::Failed);
-					}
-				},
-				Err(electrum_client::Error::Protocol(_)) => {
-					// We couldn't find the tx, do nothing.
-				},
-				Err(e) => {
-					log_error!(self.logger, "Failed to look up transaction {}: {}.", txid, e);
-					return Err(InternalError::Failed);
-				},
+		for ((txid, watch_script_pubkeys), fetched_tx) in registered.into_iter().zip(fetched) {
+			// `None`: the server doesn't know the transaction, do nothing (as before).
+			let tx = match fetched_tx {
+				Some(tx) => tx,
+				None => continue,
+			};
+			if tx.compute_txid() != *txid {
+				log_error!(self.logger, "Retrieved transaction for txid {} doesn't match expectations. This should not happen. Please verify server integrity.", txid);
+				return Err(InternalError::Failed);
 			}
+
+			// We watch an output's script_pubkey of the transaction of interest in order
+			// to retrieve the associated script history, before narrowing down our search
+			// through `filter`ing by `txid` below. Prefer a script_pubkey the transaction
+			// was registered with that actually appears in the transaction (as registered
+			// script_pubkeys may be bogus), and otherwise pick an arbitrary one, noting
+			// that electrum servers may not index OP_RETURN script_pubkeys at all.
+			let candidate_outputs =
+				tx.output.iter().filter(|output| !output.script_pubkey.is_op_return());
+			let watch_output = candidate_outputs
+				.clone()
+				.find(|output| watch_script_pubkeys.contains(&output.script_pubkey))
+				.or_else(|| candidate_outputs.clone().next())
+				.or_else(|| tx.output.iter().next());
+			if let Some(tx_out) = watch_output {
+				watched_script_pubkeys.push(tx_out.script_pubkey.clone());
+			} else {
+				debug_assert!(false, "Failed due to retrieving invalid tx data.");
+				log_error!(self.logger, "Failed due to retrieving invalid tx data.");
+				return Err(InternalError::Failed);
+			}
+			watched_txs.push((txid, tx));
 		}
 
 		let num_tx_lookups = watched_script_pubkeys.len();
@@ -327,6 +335,10 @@ impl<L: Logger> ElectrumSyncClient<L> {
 			sync_state.watched_outputs.values().flatten().count()
 		);
 
+		// Transactions found confirmed, with the height the server says, whose proofs are fetched
+		// and checked together at the end (`get_confirmed_txs`).
+		let mut candidates: Vec<(Txid, Transaction, u32)> = Vec::new();
+
 		match self.client.batch_script_get_history(watched_script_pubkeys.iter().map(|s| s.deref()))
 		{
 			Ok(results) => {
@@ -335,7 +347,7 @@ impl<L: Logger> ElectrumSyncClient<L> {
 
 				for (i, script_history) in tx_results.iter().enumerate() {
 					let (txid, tx) = &watched_txs[i];
-					if confirmed_txs.iter().any(|ctx| ctx.txid == **txid) {
+					if candidates.iter().any(|(ctxid, _, _)| *ctxid == **txid) {
 						continue;
 					}
 					let mut filtered_history =
@@ -345,10 +357,7 @@ impl<L: Logger> ElectrumSyncClient<L> {
 							// Skip if it's a an unconfirmed entry.
 							continue;
 						}
-						let prob_conf_height = history.height as u32;
-						if let Some(confirmed_tx) = self.get_confirmed_tx(tx, prob_conf_height)? {
-							confirmed_txs.push(confirmed_tx);
-						}
+						candidates.push((**txid, tx.clone(), history.height as u32));
 					}
 					if filtered_history.next().is_some() {
 						log_error!(
@@ -364,55 +373,63 @@ impl<L: Logger> ElectrumSyncClient<L> {
 					sync_state.watched_outputs.iter().flat_map(|(outpoint, script_pubkeys)| {
 						script_pubkeys.iter().map(move |_| outpoint)
 					});
-				for (watched_outpoint, script_history) in watched_outpoints.zip(output_results) {
-					for possible_output_spend in script_history {
-						if possible_output_spend.height <= 0 {
-							// Skip if it's a an unconfirmed entry.
-							continue;
-						}
+				let possible_spends: Vec<_> = watched_outpoints
+					.zip(output_results)
+					.flat_map(|(watched_outpoint, script_history)| {
+						script_history
+							.iter()
+							// Skip unconfirmed entries.
+							.filter(|h| h.height > 0)
+							.map(move |h| (watched_outpoint, h.tx_hash, h.height as u32))
+					})
+					.collect();
 
-						let txid = possible_output_spend.tx_hash;
-						if confirmed_txs.iter().any(|ctx| ctx.txid == txid) {
-							continue;
-						}
-
-						match self.client.transaction_get(&txid) {
-							Ok(tx) => {
-								if tx.compute_txid() != txid {
-									log_error!(self.logger, "Retrieved transaction for txid {} doesn't match expectations. This should not happen. Please verify server integrity.", txid);
-									return Err(InternalError::Failed);
-								}
-
-								let mut is_spend = false;
-								for txin in &tx.input {
-									if txin.previous_output == *watched_outpoint {
-										is_spend = true;
-										break;
-									}
-								}
-
-								if !is_spend {
-									continue;
-								}
-
-								let prob_conf_height = possible_output_spend.height as u32;
-								if let Some(confirmed_tx) =
-									self.get_confirmed_tx(&tx, prob_conf_height)?
-								{
-									confirmed_txs.push(confirmed_tx);
-								}
-							},
-							Err(e) => {
-								log_trace!(
-									self.logger,
-									"Inconsistency: Tx {} was unconfirmed during syncing: {}",
-									txid,
-									e
-								);
-								return Err(InternalError::Inconsistency);
-							},
-						}
+				// Every transaction that may spend a watched output, fetched in one batch: before,
+				// one `transaction_get` each.
+				let mut spend_txids: Vec<Txid> = Vec::new();
+				for (_, txid, _) in &possible_spends {
+					let known = candidates.iter().any(|(ctxid, _, _)| ctxid == txid);
+					if !known && !spend_txids.contains(txid) {
+						spend_txids.push(*txid);
 					}
+				}
+				let spend_txs = match self.client.batch_transaction_get(spend_txids.iter()) {
+					Ok(txs) if txs.len() == spend_txids.len() => txs,
+					Ok(_) => {
+						log_error!(self.logger, "Failed due to the server answering a different number of transactions than asked for.");
+						return Err(InternalError::Failed);
+					},
+					Err(e) => {
+						log_trace!(
+							self.logger,
+							"Inconsistency: a possible spend was unconfirmed during syncing: {}",
+							e
+						);
+						return Err(InternalError::Inconsistency);
+					},
+				};
+
+				// Then, in the same order as before, which of them spend the watched outputs.
+				for (watched_outpoint, txid, prob_conf_height) in possible_spends {
+					if candidates.iter().any(|(ctxid, _, _)| *ctxid == txid) {
+						continue;
+					}
+					let tx = match spend_txids.iter().position(|t| *t == txid) {
+						Some(i) => &spend_txs[i],
+						None => continue,
+					};
+					if tx.compute_txid() != txid {
+						log_error!(self.logger, "Retrieved transaction for txid {} doesn't match expectations. This should not happen. Please verify server integrity.", txid);
+						return Err(InternalError::Failed);
+					}
+
+					let is_spend =
+						tx.input.iter().any(|txin| txin.previous_output == *watched_outpoint);
+					if !is_spend {
+						continue;
+					}
+
+					candidates.push((txid, tx.clone(), prob_conf_height));
 				}
 			},
 			Err(e) => {
@@ -421,6 +438,8 @@ impl<L: Logger> ElectrumSyncClient<L> {
 			},
 		}
 
+		let mut confirmed_txs = self.get_confirmed_txs(candidates)?;
+
 		// Sort all confirmed transactions first by block height, then by in-block
 		// position, and finally feed them to the interface in order.
 		confirmed_txs.sort_unstable_by(|tx1, tx2| {
@@ -428,6 +447,51 @@ impl<L: Logger> ElectrumSyncClient<L> {
 		});
 
 		Ok(confirmed_txs)
+	}
+
+	/// The registered transactions, in the order of `txids`; `None` for one the server doesn't
+	/// know.
+	///
+	/// One batch normally. A server that doesn't know one transaction answers that item with an
+	/// error, and the client then fails the whole batch with `Error::Protocol`, so in that case the
+	/// transactions are asked for one at a time, exactly as before rl-22, to skip only the
+	/// unknown one.
+	fn fetch_watched_transactions(
+		&self, txids: &[&Txid],
+	) -> Result<Vec<Option<Transaction>>, InternalError> {
+		match self.client.batch_transaction_get(txids.iter().copied()) {
+			Ok(txs) if txs.len() == txids.len() => Ok(txs.into_iter().map(Some).collect()),
+			Ok(_) => {
+				log_error!(self.logger, "Failed due to the server answering a different number of transactions than asked for.");
+				Err(InternalError::Failed)
+			},
+			Err(electrum_client::Error::Protocol(_)) => {
+				let mut fetched = Vec::with_capacity(txids.len());
+				for txid in txids {
+					match self.client.transaction_get(txid) {
+						Ok(tx) => fetched.push(Some(tx)),
+						Err(electrum_client::Error::Protocol(_)) => {
+							// We couldn't find the tx, do nothing.
+							fetched.push(None)
+						},
+						Err(e) => {
+							log_error!(
+								self.logger,
+								"Failed to look up transaction {}: {}.",
+								txid,
+								e
+							);
+							return Err(InternalError::Failed);
+						},
+					}
+				}
+				Ok(fetched)
+			},
+			Err(e) => {
+				log_error!(self.logger, "Failed to look up transactions: {}.", e);
+				Err(InternalError::Failed)
+			},
+		}
 	}
 
 	fn get_unconfirmed_transactions<C: Deref>(
@@ -443,74 +507,112 @@ impl<L: Logger> ElectrumSyncClient<L> {
 			.flat_map(|c| c.get_relevant_txids())
 			.collect::<HashSet<(Txid, u32, Option<BlockHash>)>>();
 
-		let mut unconfirmed_txs = Vec::new();
-
+		let mut to_check = Vec::with_capacity(relevant_txids.len());
 		for (txid, conf_height, block_hash_opt) in relevant_txids {
 			if let Some(block_hash) = block_hash_opt {
-				let block_header = self.client.block_header(conf_height as usize)?;
-				if block_header.block_hash() == block_hash {
-					// Skip if the tx is still confirmed in the block in question.
-					continue;
-				}
-
-				unconfirmed_txs.push(txid);
+				to_check.push((txid, conf_height, block_hash));
 			} else {
 				log_error!(self.logger,
 					"Untracked confirmation of funding transaction. Please ensure none of your channels had been created with LDK prior to version 0.0.113!");
 				panic!("Untracked confirmation of funding transaction. Please ensure none of your channels had been created with LDK prior to version 0.0.113!");
 			}
 		}
+
+		// The headers at every height we need, in one batch: before, one `block_header` each.
+		let heights: Vec<u32> =
+			to_check.iter().map(|(_, h, _)| *h).collect::<BTreeSet<_>>().into_iter().collect();
+		let hashes = self.block_hashes_at(&heights)?;
+
+		let mut unconfirmed_txs = Vec::new();
+		for (txid, conf_height, block_hash) in to_check {
+			// Skip if the tx is still confirmed in the block in question.
+			if hashes.get(&conf_height).map(|(hash, _)| *hash) != Some(block_hash) {
+				unconfirmed_txs.push(txid);
+			}
+		}
 		Ok(unconfirmed_txs)
 	}
 
-	fn get_confirmed_tx(
-		&self, tx: &Transaction, prob_conf_height: u32,
-	) -> Result<Option<ConfirmedTx>, InternalError> {
-		let txid = tx.compute_txid();
-		match self.client.transaction_get_merkle(&txid, prob_conf_height as usize) {
-			Ok(merkle_res) => {
-				debug_assert_eq!(prob_conf_height, merkle_res.block_height as u32);
-				match self.client.block_header(prob_conf_height as usize) {
-					Ok(block_header) => {
-						let pos = merkle_res.pos;
-						if !validate_merkle_proof(&txid, &block_header.merkle_root, &merkle_res) {
-							log_trace!(
-								self.logger,
-								"Inconsistency: Block {} was unconfirmed during syncing.",
-								block_header.block_hash()
-							);
-							return Err(InternalError::Inconsistency);
-						}
-						let confirmed_tx = ConfirmedTx {
-							tx: tx.clone(),
-							txid,
-							block_header,
-							block_height: prob_conf_height,
-							pos,
-						};
-						Ok(Some(confirmed_tx))
-					},
-					Err(e) => {
-						log_error!(
-							self.logger,
-							"Failed to retrieve block header for height {}: {}.",
-							prob_conf_height,
-							e
-						);
-						Err(InternalError::Failed)
-					},
-				}
+	/// The block header at each of `heights`, with its hash, from one batch.
+	fn block_hashes_at(
+		&self, heights: &[u32],
+	) -> Result<HashMap<u32, (BlockHash, Header)>, electrum_client::Error> {
+		let headers = self.client.batch_block_header(heights)?;
+		if headers.len() != heights.len() {
+			return Err(electrum_client::Error::InvalidResponse(
+				"a different number of headers than asked for".into(),
+			));
+		}
+		Ok(heights.iter().copied().zip(headers.into_iter().map(|h| (h.block_hash(), h))).collect())
+	}
+
+	/// Checks that each candidate is in the block at the height the server gave, and builds its
+	/// `ConfirmedTx`. The proofs come in one batch and the headers in another: before rl-22, each
+	/// candidate cost a `transaction_get_merkle` and a `block_header` of its own.
+	fn get_confirmed_txs(
+		&self, candidates: Vec<(Txid, Transaction, u32)>,
+	) -> Result<Vec<ConfirmedTx>, InternalError> {
+		if candidates.is_empty() {
+			return Ok(Vec::new());
+		}
+
+		let proof_requests: Vec<(Txid, usize)> =
+			candidates.iter().map(|(txid, _, height)| (*txid, *height as usize)).collect();
+		let proofs = match self.client.batch_transaction_get_merkle(&proof_requests) {
+			Ok(proofs) if proofs.len() == candidates.len() => proofs,
+			Ok(_) => {
+				log_error!(self.logger, "Failed due to the server answering a different number of proofs than asked for.");
+				return Err(InternalError::Failed);
 			},
 			Err(e) => {
 				log_trace!(
 					self.logger,
-					"Inconsistency: Tx {} was unconfirmed during syncing: {}",
-					txid,
+					"Inconsistency: a transaction was unconfirmed during syncing: {}",
 					e
 				);
-				Err(InternalError::Inconsistency)
+				return Err(InternalError::Inconsistency);
 			},
+		};
+
+		let heights: Vec<u32> =
+			candidates.iter().map(|(_, _, h)| *h).collect::<BTreeSet<_>>().into_iter().collect();
+		let headers = match self.block_hashes_at(&heights) {
+			Ok(headers) => headers,
+			Err(e) => {
+				log_error!(
+					self.logger,
+					"Failed to retrieve block headers at heights {:?}: {}.",
+					heights,
+					e
+				);
+				return Err(InternalError::Failed);
+			},
+		};
+
+		let mut confirmed_txs = Vec::with_capacity(candidates.len());
+		for ((txid, tx, prob_conf_height), merkle_res) in candidates.into_iter().zip(proofs) {
+			debug_assert_eq!(prob_conf_height, merkle_res.block_height as u32);
+			let block_header = match headers.get(&prob_conf_height) {
+				Some((_, header)) => *header,
+				None => return Err(InternalError::Failed),
+			};
+			if !validate_merkle_proof(&txid, &block_header.merkle_root, &merkle_res) {
+				log_trace!(
+					self.logger,
+					"Inconsistency: Block {} was unconfirmed during syncing.",
+					block_header.block_hash()
+				);
+				return Err(InternalError::Inconsistency);
+			}
+			confirmed_txs.push(ConfirmedTx {
+				tx,
+				txid,
+				block_header,
+				block_height: prob_conf_height,
+				pos: merkle_res.pos,
+			});
 		}
+		Ok(confirmed_txs)
 	}
 
 	/// Returns a reference to the underlying Electrum client.

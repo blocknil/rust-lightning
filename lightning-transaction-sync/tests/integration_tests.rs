@@ -429,3 +429,115 @@ fn test_conflicting_output_watches_separate_syncs() {
 	do_test_conflicting_output_watches(true, false);
 	do_test_conflicting_output_watches(true, true);
 }
+
+/// Sends `n` transactions, registers each one and the output each one spends, confirms them,
+/// and returns how many Electrum round trips a freshly started `ElectrumSyncClient` makes to
+/// sync them against a `Confirm` that already knows of earlier confirmations: what a node start
+/// costs.
+#[cfg(feature = "_electrum")]
+fn electrum_start_round_trips(n: usize) -> usize {
+	use electrum_client::ElectrumApi;
+
+	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
+	generate_blocks_and_wait(&bitcoind, &electrsd, 101);
+	let logger = TestLogger::new();
+	let electrum_url = format!("tcp://{}", electrsd.electrum_url);
+	let confirmable = TestConfirmable::new();
+
+	let mut txids = Vec::new();
+	let mut registrations = Vec::new();
+	for _ in 0..n {
+		let address = bitcoind.client.new_address().unwrap();
+		let txid: Txid = bitcoind
+			.client
+			.send_to_address(&address, Amount::from_sat(5000))
+			.unwrap()
+			.0
+			.parse()
+			.unwrap();
+		let tx = get_wallet_transaction(&bitcoind, txid).0;
+		let prev_outpoint = tx.input[0].previous_output;
+		let prev_tx = get_wallet_transaction(&bitcoind, prev_outpoint.txid).0;
+		let output = WatchedOutput {
+			block_hash: None,
+			outpoint: OutPoint { txid: prev_outpoint.txid, index: prev_outpoint.vout as u16 },
+			script_pubkey: prev_tx.output[prev_outpoint.vout as usize].script_pubkey.clone(),
+		};
+		txids.push(txid);
+		registrations.push((txid, address.script_pubkey(), output));
+	}
+	generate_blocks_and_wait(&bitcoind, &electrsd, 1);
+
+	let register = |tx_sync: &ElectrumSyncClient<&TestLogger>| {
+		for (txid, script_pubkey, output) in &registrations {
+			tx_sync.register_tx(txid, script_pubkey);
+			tx_sync.register_output(output.clone());
+		}
+	};
+
+	// The node's first run: everything is confirmed for the first time.
+	let first_run = ElectrumSyncClient::new(electrum_url.clone(), &logger).unwrap();
+	register(&first_run);
+	first_run.sync(vec![&confirmable]).unwrap();
+	for txid in &txids {
+		assert!(confirmable.confirmed_txs.lock().unwrap().contains_key(txid));
+	}
+
+	// The node restarts: a new sync client, the same registrations, and a `Confirm` that already
+	// knows every confirmation, so they are all checked again.
+	let restart = ElectrumSyncClient::new(electrum_url, &logger).unwrap();
+	register(&restart);
+	let before = restart.client().calls_made().unwrap();
+	restart.sync(vec![&confirmable]).unwrap();
+	let round_trips = restart.client().calls_made().unwrap() - before;
+	for txid in &txids {
+		assert!(confirmable.confirmed_txs.lock().unwrap().contains_key(txid));
+	}
+	assert!(confirmable.unconfirmed_txs.lock().unwrap().is_empty());
+	round_trips
+}
+
+/// A node start's sync waits on the server a fixed number of times, however many transactions it
+/// watches: its requests are batched rather than sent one per transaction.
+#[test]
+#[cfg(feature = "_electrum")]
+fn test_electrum_start_round_trips_do_not_grow_with_transactions() {
+	let with_two = electrum_start_round_trips(2);
+	let with_six = electrum_start_round_trips(6);
+	println!(
+		"Electrum round trips on restart: {} with 2 transactions, {} with 6",
+		with_two, with_six
+	);
+	assert_eq!(with_two, with_six, "round trips grew with the number of watched transactions");
+}
+
+/// A registered transaction the server doesn't know is skipped, and the others still confirm:
+/// one unknown transaction fails a whole batch, and the sync must fall back rather than fail.
+#[test]
+#[cfg(feature = "_electrum")]
+fn test_electrum_unknown_registered_transaction_is_skipped() {
+	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
+	generate_blocks_and_wait(&bitcoind, &electrsd, 101);
+	let logger = TestLogger::new();
+	let tx_sync =
+		ElectrumSyncClient::new(format!("tcp://{}", electrsd.electrum_url), &logger).unwrap();
+	let confirmable = TestConfirmable::new();
+
+	let address = bitcoind.client.new_address().unwrap();
+	let txid: Txid = bitcoind
+		.client
+		.send_to_address(&address, Amount::from_sat(5000))
+		.unwrap()
+		.0
+		.parse()
+		.unwrap();
+	let unknown_txid: Txid =
+		"0000000000000000000000000000000000000000000000000000000000000001".parse().unwrap();
+	tx_sync.register_tx(&unknown_txid, &address.script_pubkey());
+	tx_sync.register_tx(&txid, &address.script_pubkey());
+	generate_blocks_and_wait(&bitcoind, &electrsd, 1);
+
+	tx_sync.sync(vec![&confirmable]).unwrap();
+	assert!(confirmable.confirmed_txs.lock().unwrap().contains_key(&txid));
+	assert!(!confirmable.confirmed_txs.lock().unwrap().contains_key(&unknown_txid));
+}
