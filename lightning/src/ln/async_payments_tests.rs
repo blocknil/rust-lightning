@@ -3811,3 +3811,45 @@ fn async_payment_e2e_release_before_hold_registered() {
 		claim_payment_along_route(ClaimAlongRouteArgs::new(sender, route, keysend_preimage));
 	assert_eq!(res, Some(PaidBolt12Invoice::StaticInvoice(static_invoice)));
 }
+
+#[test]
+fn htlc_hold_is_only_advertised_in_init_to_peers_with_only_private_channels() {
+	// Blocknil patch: a node that holds HTLCs advertises HtlcHold in `init` only to peers whose
+	// channels with it are all unannounced. Some public nodes close the connection right after
+	// `init` from a peer that sets the experimental bit, so public peers must not see it.
+	let chanmon_cfgs = create_chanmon_cfgs(4);
+	let node_cfgs = create_node_cfgs(4, &chanmon_cfgs);
+	let mut lsp_cfg = test_default_channel_config();
+	lsp_cfg.enable_htlc_hold = true;
+	let node_chanmgrs = create_node_chanmgrs(4, &node_cfgs, &[Some(lsp_cfg), None, None, None]);
+	let nodes = create_network(4, &node_cfgs, &node_chanmgrs);
+
+	let lsp = &nodes[0];
+	let (customer_id, router_id, stranger_id) = (
+		nodes[1].node.get_our_node_id(),
+		nodes[2].node.get_our_node_id(),
+		nodes[3].node.get_our_node_id(),
+	);
+
+	// The node still offers the feature in general.
+	assert!(lsp.node.provided_node_features().supports_htlc_hold());
+
+	// No channel yet: nobody sees the bit.
+	for peer in [customer_id, router_id, stranger_id] {
+		assert!(!lsp.node.provided_init_features(peer).supports_htlc_hold());
+	}
+
+	create_unannounced_chan_between_nodes_with_value(&nodes, 0, 1, 100_000, 0);
+	create_announced_chan_between_nodes(&nodes, 0, 2);
+
+	// A customer, with only an unannounced channel, sees it.
+	assert!(lsp.node.provided_init_features(customer_id).supports_htlc_hold());
+	// A public routing peer doesn't.
+	assert!(!lsp.node.provided_init_features(router_id).supports_htlc_hold());
+	// Nor does a peer with no channel at all.
+	assert!(!lsp.node.provided_init_features(stranger_id).supports_htlc_hold());
+
+	// A peer with an announced channel next to an unannounced one is a public peer.
+	create_unannounced_chan_between_nodes_with_value(&nodes, 0, 2, 100_000, 0);
+	assert!(!lsp.node.provided_init_features(router_id).supports_htlc_hold());
+}
