@@ -3513,7 +3513,7 @@ fn client_trusts_lsp_fee_collected_across_payment_parts() {
 	// The client claims, and we learn of the preimage for both parts. The client only releases
 	// the second fulfill once the first commitment update completed, so relay messages between
 	// the two until they settle. Messages towards the payer are not needed here.
-	client_node.inner.node.claim_funds(preimage, Default::default());
+	client_node.inner.node.claim_funds(preimage);
 	check_added_monitors(&client_node.inner, 2);
 	let _ = client_node.inner.node.get_and_clear_pending_events();
 	let mut num_fulfills = 0;
