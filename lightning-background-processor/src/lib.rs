@@ -3575,10 +3575,16 @@ mod tests {
 				tokio::time::sleep(Duration::from_millis(1)).await
 			);
 			exit_sender.send(()).unwrap();
+			// Blocknil patch: handed back, so they outlive the processor (see `nodes_alive`).
+			nodes
 		});
 		let (r1, r2) = tokio::join!(t1, t2);
 		r1.unwrap().unwrap();
-		r2.unwrap()
+		let nodes_alive = r2.unwrap();
+		// The processor (`t1`) borrows `nodes` through the `&'static` references above. Dropped here,
+		// after it finished, rather than when `t2` did: its final shutdown persists the liquidity
+		// manager (upstream #5409), which then read freed memory (SIGSEGV, SIGBUS, poisoned mutexes).
+		drop(nodes_alive);
 	}
 
 	macro_rules! do_test_payment_path_scoring {
@@ -3787,17 +3793,25 @@ mod tests {
 			do_test_payment_path_scoring!(nodes, receiver.recv().await);
 			exit_sender.send(()).unwrap();
 
-			let log_entries = nodes[0].logger.lines.lock().unwrap();
-			let expected_log = "Persisting scorer after update".to_string();
-			assert_eq!(
-				*log_entries.get(&("lightning_background_processor", expected_log)).unwrap(),
-				5
-			);
+			{
+				let log_entries = nodes[0].logger.lines.lock().unwrap();
+				let expected_log = "Persisting scorer after update".to_string();
+				assert_eq!(
+					*log_entries.get(&("lightning_background_processor", expected_log)).unwrap(),
+					5
+				);
+			}
+			// Blocknil patch: handed back, so they outlive the processor (see `nodes_alive`).
+			nodes
 		});
 
 		let (r1, r2) = tokio::join!(t1, t2);
 		r1.unwrap().unwrap();
-		r2.unwrap()
+		let nodes_alive = r2.unwrap();
+		// The processor (`t1`) borrows `nodes` through the `&'static` references above. Dropped here,
+		// after it finished, rather than when `t2` did: its final shutdown persists the liquidity
+		// manager (upstream #5409), which then read freed memory (SIGSEGV, SIGBUS, poisoned mutexes).
+		drop(nodes_alive);
 	}
 
 	#[tokio::test]
