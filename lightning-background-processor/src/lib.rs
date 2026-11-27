@@ -3557,10 +3557,17 @@ mod tests {
 			|| Some(Duration::from_secs(1696300000)),
 		);
 
+		// Blocknil patch: the processor (`t1`) borrows `nodes` through the `&'static` references
+		// above, so they are kept here until it has finished, whether `t2` ends or panics. Its final
+		// shutdown persists the liquidity manager (upstream #5409); with `nodes` dropped by `t2`, that
+		// read freed memory (SIGSEGV, SIGBUS, poisoned mutexes), and a failing assert in `t2` showed
+		// as a crash.
+		let nodes = Arc::new(nodes);
+		let nodes_t2 = Arc::clone(&nodes);
 		let t1 = tokio::spawn(bp_future);
 		let t2 = tokio::spawn(async move {
 			do_test_not_pruning_network_graph_until_graph_sync_completion!(
-				nodes,
+				nodes_t2,
 				{
 					let mut i = 0;
 					loop {
@@ -3575,16 +3582,11 @@ mod tests {
 				tokio::time::sleep(Duration::from_millis(1)).await
 			);
 			exit_sender.send(()).unwrap();
-			// Blocknil patch: handed back, so they outlive the processor (see `nodes_alive`).
-			nodes
 		});
 		let (r1, r2) = tokio::join!(t1, t2);
 		r1.unwrap().unwrap();
-		let nodes_alive = r2.unwrap();
-		// The processor (`t1`) borrows `nodes` through the `&'static` references above. Dropped here,
-		// after it finished, rather than when `t2` did: its final shutdown persists the liquidity
-		// manager (upstream #5409), which then read freed memory (SIGSEGV, SIGBUS, poisoned mutexes).
-		drop(nodes_alive);
+		r2.unwrap();
+		drop(nodes);
 	}
 
 	macro_rules! do_test_payment_path_scoring {
@@ -3788,30 +3790,30 @@ mod tests {
 			false,
 			|| Some(Duration::ZERO),
 		);
+		// Blocknil patch: the processor (`t1`) borrows `nodes` through the `&'static` references
+		// above, so they are kept here until it has finished, whether `t2` ends or panics. Its final
+		// shutdown persists the liquidity manager (upstream #5409); with `nodes` dropped by `t2`, that
+		// read freed memory (SIGSEGV, SIGBUS, poisoned mutexes), and a failing assert in `t2` showed
+		// as a crash.
+		let nodes = Arc::new(nodes);
+		let nodes_t2 = Arc::clone(&nodes);
 		let t1 = tokio::spawn(bp_future);
 		let t2 = tokio::spawn(async move {
-			do_test_payment_path_scoring!(nodes, receiver.recv().await);
+			do_test_payment_path_scoring!(nodes_t2, receiver.recv().await);
 			exit_sender.send(()).unwrap();
 
-			{
-				let log_entries = nodes[0].logger.lines.lock().unwrap();
-				let expected_log = "Persisting scorer after update".to_string();
-				assert_eq!(
-					*log_entries.get(&("lightning_background_processor", expected_log)).unwrap(),
-					5
-				);
-			}
-			// Blocknil patch: handed back, so they outlive the processor (see `nodes_alive`).
-			nodes
+			let log_entries = nodes_t2[0].logger.lines.lock().unwrap();
+			let expected_log = "Persisting scorer after update".to_string();
+			assert_eq!(
+				*log_entries.get(&("lightning_background_processor", expected_log)).unwrap(),
+				5
+			);
 		});
 
 		let (r1, r2) = tokio::join!(t1, t2);
 		r1.unwrap().unwrap();
-		let nodes_alive = r2.unwrap();
-		// The processor (`t1`) borrows `nodes` through the `&'static` references above. Dropped here,
-		// after it finished, rather than when `t2` did: its final shutdown persists the liquidity
-		// manager (upstream #5409), which then read freed memory (SIGSEGV, SIGBUS, poisoned mutexes).
-		drop(nodes_alive);
+		r2.unwrap();
+		drop(nodes);
 	}
 
 	#[tokio::test]
