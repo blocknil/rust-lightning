@@ -11604,8 +11604,14 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 			} else {
 				// Blocknil patch (rl3-next-splice-broadcast, bitcoin-wallet#207): a splice round
 				// signed in this same resumption is not this transaction. `tx` is then the
-				// channel's promoted, still unconfirmed 0-conf splice, and the new round, which
+				// channel's current funding while it is unconfirmed at 0 conf, a promoted splice or
+				// the channel's initial funding during its first splice, and the new round, which
 				// spends it, is broadcast right after it below.
+				if let Some((signed_tx, TransactionType::InteractiveFunding { .. })) =
+					funding_tx_signed.as_ref().and_then(|v| v.funding_tx.as_ref())
+				{
+					debug_assert!(signed_tx.input.iter().any(|input| input.previous_output.txid == tx.compute_txid()));
+				}
 				if let Some((funding_tx, tx_type)) = funding_tx_signed.as_ref().and_then(|v| v.funding_tx.as_ref())
 					.filter(|(_, tx_type)| !matches!(tx_type, TransactionType::InteractiveFunding { .. }))
 				{
@@ -11621,8 +11627,9 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 		}
 		// Blocknil patch (rl3-next-splice-broadcast, bitcoin-wallet#207): not an `else`. When the
 		// opener's monitor update for a splice round completes after the peer's `tx_signatures`,
-		// `funding_broadcastable` above can hold the promoted 0-conf round before it, and this
-		// round must still go out rather than wait for the peer or the next restore.
+		// `funding_broadcastable` above can hold the channel's unconfirmed 0-conf funding (a
+		// promoted splice, or the initial funding during the first splice) that this round spends,
+		// and this round must still go out rather than wait for the peer or the next restore.
 		if let Some((tx, tx_type)) = funding_tx_signed
 			.as_mut()
 			.and_then(|v| v.funding_tx.take())

@@ -18100,9 +18100,12 @@ fn test_opener_broadcasts_next_splice_signed_during_monitor_restore_after_0conf_
 			tx.input.iter().any(|input| input.previous_output.txid == round_1_tx.compute_txid())
 		})
 		.unwrap_or_else(|| panic!("round 2 was not broadcast: {txn:?}"));
-	let round_1_position = txn.iter().position(|tx| *tx == round_1_tx);
+	let round_1_position = txn
+		.iter()
+		.position(|tx| *tx == round_1_tx)
+		.unwrap_or_else(|| panic!("round 1 was not rebroadcast: {txn:?}"));
 	assert!(
-		round_1_position.map_or(true, |position| position < round_2_position),
+		round_1_position < round_2_position,
 		"round 2 was broadcast before round 1, which it spends: {txn:?}"
 	);
 	let round_2_tx = txn[round_2_position].clone();
