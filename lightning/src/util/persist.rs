@@ -2362,6 +2362,106 @@ mod tests {
 
 	// Test that if the `MonitorUpdatingPersister`'s can't actually write, trying to persist a
 	// monitor or update with it results in the persister returning an UnrecoverableError status.
+	// Blocknil test (rl3-one-way-r7): since upstream #5663, an update the monitor refuses (a
+	// commitment update after it saw the funding spent) is stored as an update like any other, and
+	// the reader logs the replay's refusal and goes on. Before it (rust-lightning r6), such an
+	// update was never stored, and the reader failed the whole monitor on a refused replay. So a
+	// store r7 wrote can hold what r6 can't read: here, a full monitor that has seen the funding
+	// spend, then a commitment update after it. r7 reads it; replaying that update on the stored
+	// monitor is refused, which r6's reader turns into "Monitor update failed". This is why r7 is
+	// a one-way upgrade.
+	#[test]
+	fn a_refused_update_after_a_spend_is_read_back() {
+		let chanmon_cfgs = create_chanmon_cfgs(2);
+		let kv_store_1 = TestStore::new(false);
+		let persister_1 = MonitorUpdatingPersister::new(
+			&kv_store_1,
+			&chanmon_cfgs[1].logger,
+			1000,
+			&chanmon_cfgs[1].keys_manager,
+			&chanmon_cfgs[1].keys_manager,
+			&chanmon_cfgs[1].tx_broadcaster,
+			&chanmon_cfgs[1].fee_estimator,
+		);
+		let mut node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+		node_cfgs[1].chain_monitor = test_utils::TestChainMonitor::new(
+			Some(&chanmon_cfgs[1].chain_source),
+			&chanmon_cfgs[1].tx_broadcaster,
+			&chanmon_cfgs[1].logger,
+			&chanmon_cfgs[1].fee_estimator,
+			&persister_1,
+			&chanmon_cfgs[1].keys_manager,
+		);
+		let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
+		let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+		let chan_id = create_announced_chan_between_nodes(&nodes, 0, 1).2;
+		send_payment(&nodes[0], &[&nodes[1]], 1_000_000);
+
+		// The stored monitor, made to see the funding spent and written back in full, as a
+		// chain-driven persist would.
+		let mut persisted = persister_1.read_all_channel_monitors_with_updates().unwrap();
+		assert_eq!(persisted.len(), 1);
+		let (_, spend_seen) = persisted.pop().unwrap();
+		let spend_seen_update_id = spend_seen.get_latest_update_id();
+		let commitment_tx = crate::get_local_commitment_txn!(nodes[0], chan_id).swap_remove(0);
+		let best_block = spend_seen.current_best_block();
+		spend_seen.transactions_confirmed(
+			&create_dummy_header(best_block.block_hash, 42),
+			&[(0, &commitment_tx)],
+			best_block.height + 1,
+			&chanmon_cfgs[1].tx_broadcaster,
+			&chanmon_cfgs[1].fee_estimator,
+			&chanmon_cfgs[1].logger,
+		);
+		assert!(spend_seen.no_further_updates_allowed());
+		let monitor_name = spend_seen.persistence_key();
+		assert_eq!(
+			persister_1.update_persisted_channel(monitor_name, None, &spend_seen),
+			ChannelMonitorUpdateStatus::Completed
+		);
+
+		// The live channel, which hasn't seen the spend, moves on: its commitment updates are
+		// stored after that monitor, as updates.
+		send_payment(&nodes[0], &[&nodes[1]], 1_000_000);
+		let refused_update = nodes[1]
+			.chain_monitor
+			.monitor_updates
+			.lock()
+			.unwrap()
+			.get(&chan_id)
+			.unwrap()
+			.iter()
+			.find(|update| update.update_id == spend_seen_update_id + 1)
+			.unwrap()
+			.clone();
+		let update_list = KVStoreSync::list(
+			&kv_store_1,
+			CHANNEL_MONITOR_UPDATE_PERSISTENCE_PRIMARY_NAMESPACE,
+			&monitor_name.to_string(),
+		)
+		.unwrap();
+		assert!(
+			update_list.contains(&UpdateName::from(refused_update.update_id).as_str().to_string())
+		);
+
+		// r7 reads the store back, up to the live channel's latest update.
+		let live_update_id = crate::get_monitor!(nodes[1], chan_id).get_latest_update_id();
+		assert!(live_update_id > spend_seen_update_id + 1);
+		let (_, read_back) =
+			persister_1.read_channel_monitor_with_updates(&monitor_name.to_string()).unwrap();
+		assert_eq!(read_back.get_latest_update_id(), live_update_id);
+
+		// The replay r6's reader would make of that first stored update is refused.
+		assert!(spend_seen
+			.update_monitor(
+				&refused_update,
+				&chanmon_cfgs[1].tx_broadcaster,
+				&chanmon_cfgs[1].fee_estimator,
+				&chanmon_cfgs[1].logger,
+			)
+			.is_err());
+	}
+
 	#[test]
 	fn unrecoverable_error_on_write_failure() {
 		// Set up a dummy channel and force close. This will produce a monitor
