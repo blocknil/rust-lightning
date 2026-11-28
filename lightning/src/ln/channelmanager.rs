@@ -11602,7 +11602,13 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 					}
 				};
 			} else {
-				if let Some((funding_tx, tx_type)) = funding_tx_signed.as_ref().and_then(|v| v.funding_tx.as_ref()) {
+				// Blocknil patch (rl3-next-splice-broadcast, bitcoin-wallet#207): a splice round
+				// signed in this same resumption is not this transaction. `tx` is then the
+				// channel's promoted, still unconfirmed 0-conf splice, and the new round, which
+				// spends it, is broadcast right after it below.
+				if let Some((funding_tx, tx_type)) = funding_tx_signed.as_ref().and_then(|v| v.funding_tx.as_ref())
+					.filter(|(_, tx_type)| !matches!(tx_type, TransactionType::InteractiveFunding { .. }))
+				{
 					debug_assert_eq!(&tx, funding_tx);
 					debug_assert!(matches!(tx_type, TransactionType::Funding { .. }));
 				}
@@ -11612,7 +11618,12 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 					TransactionType::Funding { channels: vec![(counterparty_node_id, channel.context.channel_id())] },
 				)]);
 			}
-		} else if let Some((tx, tx_type)) = funding_tx_signed
+		}
+		// Blocknil patch (rl3-next-splice-broadcast, bitcoin-wallet#207): not an `else`. When the
+		// opener's monitor update for a splice round completes after the peer's `tx_signatures`,
+		// `funding_broadcastable` above can hold the promoted 0-conf round before it, and this
+		// round must still go out rather than wait for the peer or the next restore.
+		if let Some((tx, tx_type)) = funding_tx_signed
 			.as_mut()
 			.and_then(|v| v.funding_tx.take())
 			.filter(|(_, tx_type)| matches!(tx_type, TransactionType::InteractiveFunding { .. }))

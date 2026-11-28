@@ -17988,3 +17988,145 @@ fn test_splice_raises_private_channel_htlc_in_flight_limits() {
 	);
 	send_payment(&nodes[0], &[&nodes[1]], payment_msat);
 }
+
+#[test]
+fn test_opener_broadcasts_next_splice_signed_during_monitor_restore_after_0conf_promotion() {
+	// Blocknil patch (rl3-next-splice-broadcast, bitcoin-wallet#207). Once a 0-conf splice is
+	// promoted, it is the channel's unconfirmed `funding`, so every monitor restore on the opener
+	// offers it as `funding_broadcastable` again. If the opener's monitor update for the next
+	// splice round's `commitment_signed` is still in flight when the peer's `tx_signatures`
+	// arrive, the restore that completes it carries both that round-1 rebroadcast and the round-2
+	// transaction the exchange just signed. The opener must broadcast round 2 as well, after round
+	// 1 which it spends, rather than drop it (and, in debug builds, trip the assertion that the two
+	// are the same transaction).
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let mut config = test_default_channel_config();
+	config.channel_handshake_limits.trust_own_funding_0conf = true;
+	config.channel_config.inbound_splice_min_depth = 0;
+	config.channel_config.outbound_splice_min_depth = 0;
+	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[Some(config.clone()), Some(config)]);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+
+	let node_id_0 = nodes[0].node.get_our_node_id();
+	let node_id_1 = nodes[1].node.get_our_node_id();
+
+	// Node 0 opens the channel, so it is the one that (re-)broadcasts its funding on a restore.
+	let (funding_tx, channel_id) =
+		open_zero_conf_channel_with_value(&nodes[0], &nodes[1], None, 100_000, 0);
+	mine_transaction(&nodes[0], &funding_tx);
+	mine_transaction(&nodes[1], &funding_tx);
+
+	// Round 1: a 0-conf splice-in, locked on both sides and so promoted, but never confirmed.
+	provide_utxo_reserves(&nodes, 1, Amount::from_sat(100_000));
+	let contribution =
+		do_initiate_splice_in(&nodes[0], &nodes[1], channel_id, Amount::from_sat(50_000));
+	let new_funding_script = complete_splice_handshake(&nodes[0], &nodes[1]);
+	complete_interactive_funding_negotiation(
+		&nodes[0],
+		&nodes[1],
+		channel_id,
+		contribution,
+		new_funding_script,
+	);
+	let (round_1_tx, splice_locked) = sign_interactive_funding_tx(
+		SignInteractiveFundingTxArgs::new(&nodes[0], &nodes[1]).zero_conf(),
+	);
+	let (splice_locked_for_node_1, _) = splice_locked.expect("a 0-conf splice locks at signing");
+	expect_splice_pending_event(&nodes[0], &node_id_1);
+	lock_splice(&nodes[0], &nodes[1], &splice_locked_for_node_1, true, &[]);
+	assert_eq!(
+		get_monitor!(nodes[0], channel_id).get_funding_txo().txid,
+		round_1_tx.compute_txid()
+	);
+	nodes[0].tx_broadcaster.clear();
+	nodes[1].tx_broadcaster.clear();
+
+	// Round 2: node 0 splices out. The shared input counts towards node 0's contribution, so node
+	// 1 signs first and node 0 receives its `tx_signatures` before sending its own.
+	let outputs = vec![TxOut {
+		value: Amount::from_sat(1_000),
+		script_pubkey: nodes[0].wallet_source.get_change_script().unwrap(),
+	}];
+	let contribution = initiate_splice_out(&nodes[0], &nodes[1], channel_id, outputs).unwrap();
+	negotiate_splice_tx(&nodes[0], &nodes[1], channel_id, contribution);
+	let event = get_event!(nodes[0], Event::FundingTransactionReadyForSigning);
+	if let Event::FundingTransactionReadyForSigning { unsigned_transaction, .. } = event {
+		let partially_signed_tx = nodes[0].wallet_source.sign_tx(unsigned_transaction).unwrap();
+		nodes[0]
+			.node
+			.funding_transaction_signed(&channel_id, &node_id_1, partially_signed_tx)
+			.unwrap();
+	} else {
+		panic!("Expected FundingTransactionReadyForSigning event");
+	}
+	let initiator_commit_sig = get_htlc_update_msgs(&nodes[0], &node_id_1);
+	nodes[1].node.handle_commitment_signed(node_id_0, &initiator_commit_sig.commitment_signed[0]);
+	check_added_monitors(&nodes[1], 1);
+	let msg_events = nodes[1].node.get_and_clear_pending_msg_events();
+	assert_eq!(msg_events.len(), 2, "{msg_events:?}");
+	let counterparty_commit_sig =
+		if let MessageSendEvent::UpdateHTLCs { ref updates, .. } = &msg_events[0] {
+			updates.commitment_signed[0].clone()
+		} else {
+			panic!("Expected UpdateHTLCs message");
+		};
+	let counterparty_tx_signatures =
+		if let MessageSendEvent::SendTxSignatures { ref msg, .. } = &msg_events[1] {
+			msg.clone()
+		} else {
+			panic!("Expected SendTxSignatures message");
+		};
+
+	// Node 0's monitor update for node 1's `commitment_signed` stays in flight while node 1's
+	// `tx_signatures` arrive.
+	chanmon_cfgs[0].persister.set_update_ret(ChannelMonitorUpdateStatus::InProgress);
+	nodes[0].node.handle_commitment_signed(node_id_1, &counterparty_commit_sig);
+	check_added_monitors(&nodes[0], 1);
+	assert!(nodes[0].node.get_and_clear_pending_msg_events().is_empty());
+	nodes[0].node.handle_tx_signatures(node_id_1, &counterparty_tx_signatures);
+	assert!(nodes[0].node.get_and_clear_pending_msg_events().is_empty());
+	assert!(nodes[0].tx_broadcaster.txn_broadcast().is_empty());
+
+	// Completing the update restores the channel with both transactions to broadcast.
+	nodes[0].chain_monitor.complete_sole_pending_chan_update(&channel_id);
+	chanmon_cfgs[0].persister.set_update_ret(ChannelMonitorUpdateStatus::Completed);
+	expect_splice_pending_event(&nodes[0], &node_id_1);
+
+	let txn = nodes[0].tx_broadcaster.txn_broadcast();
+	let round_2_position = txn
+		.iter()
+		.position(|tx| {
+			tx.input.iter().any(|input| input.previous_output.txid == round_1_tx.compute_txid())
+		})
+		.unwrap_or_else(|| panic!("round 2 was not broadcast: {txn:?}"));
+	let round_1_position = txn.iter().position(|tx| *tx == round_1_tx);
+	assert!(
+		round_1_position.map_or(true, |position| position < round_2_position),
+		"round 2 was broadcast before round 1, which it spends: {txn:?}"
+	);
+	let round_2_tx = txn[round_2_position].clone();
+
+	// The rest of the round goes on as usual: node 0's `tx_signatures`, then its 0-conf
+	// `splice_locked`, which promotes round 2 on both sides.
+	let msg_events = nodes[0].node.get_and_clear_pending_msg_events();
+	assert_eq!(msg_events.len(), 2, "{msg_events:?}");
+	if let MessageSendEvent::SendTxSignatures { msg, .. } = &msg_events[0] {
+		nodes[1].node.handle_tx_signatures(node_id_0, msg);
+	} else {
+		panic!("Unexpected event {:?}", msg_events[0]);
+	}
+	let splice_locked_for_node_1 =
+		if let MessageSendEvent::SendSpliceLocked { msg, .. } = &msg_events[1] {
+			msg.clone()
+		} else {
+			panic!("Unexpected event {:?}", msg_events[1]);
+		};
+	let txn = nodes[1].tx_broadcaster.txn_broadcast();
+	assert!(txn.contains(&round_2_tx), "{txn:?}");
+	lock_splice(&nodes[0], &nodes[1], &splice_locked_for_node_1, true, &[]);
+	assert_eq!(
+		get_monitor!(nodes[0], channel_id).get_funding_txo().txid,
+		round_2_tx.compute_txid()
+	);
+}
